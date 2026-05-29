@@ -14,9 +14,4 @@ AllowTcpForwarding yes
 AllowRemoteForwarding yes
 GatewayPorts yes
 
-# Parsed for compatibility, but not implemented yet.
-X11Forwarding no
-X11DisplayOffset 10
-X11UseLocalhost yes
-
 LogLevel info

@@ -52,11 +52,5 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if config.x11_forwarding {
-        log::warn!(
-            "X11Forwarding is configured but not implemented yet; prefer waypipe, xpra, or TCP-tunneled GUI remoting on top of narrowd"
-        );
-    }
-
     sshd::run(config).await
 }

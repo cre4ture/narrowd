@@ -12,10 +12,14 @@ Current MVP surface:
 
 Not implemented yet:
 
-- X11 forwarding
 - config reload
-- multi-user account/session management
-- legacy SCP protocol compatibility
+
+Explicit NON-Goals:
+
+- multi-user account/session management (instead, use `su` to change user in terminal when logged in)
+- support of any legacy or outdated functionality (use modern alternatives instead)
+    - legacy SCP protocol (modern `scp` tool uses sftp already by default)
+- X11 forwarding (use waypipe and TCP tunnel instead)
 
 Quick start:
 

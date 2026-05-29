@@ -22,11 +22,6 @@ AllowTcpForwarding yes
 AllowRemoteForwarding yes
 GatewayPorts yes
 
-# Parsed for compatibility, but X11 forwarding is not implemented yet.
-X11Forwarding no
-X11DisplayOffset 10
-X11UseLocalhost yes
-
 LogLevel info
 ";
 
@@ -88,9 +83,6 @@ pub struct AppConfig {
     pub allow_tcp_forwarding: bool,
     pub allow_remote_forwarding: bool,
     pub gateway_ports: bool,
-    pub x11_forwarding: bool,
-    pub x11_display_offset: u16,
-    pub x11_use_localhost: bool,
     pub log_level: LogLevel,
 }
 
@@ -127,9 +119,6 @@ impl AppConfig {
             allow_tcp_forwarding: true,
             allow_remote_forwarding: true,
             gateway_ports: true,
-            x11_forwarding: false,
-            x11_display_offset: 10,
-            x11_use_localhost: true,
             log_level: LogLevel::Info,
         })
     }
@@ -197,25 +186,6 @@ impl AppConfig {
                 "gatewayports" => {
                     self.gateway_ports = parse_bool(values[0])
                         .with_context(|| format!("invalid GatewayPorts on line {line_number}"))?;
-                }
-                "x11forwarding" => {
-                    self.x11_forwarding = parse_bool(values[0])
-                        .with_context(|| format!("invalid X11Forwarding on line {line_number}"))?;
-                }
-                "x11displayoffset" => {
-                    self.x11_display_offset = values[0].parse::<u16>().with_context(|| {
-                        format!("invalid X11DisplayOffset on line {line_number}")
-                    })?;
-                }
-                "x11uselocalhost" => {
-                    self.x11_use_localhost = parse_bool(values[0]).with_context(|| {
-                        format!("invalid X11UseLocalhost on line {line_number}")
-                    })?;
-                }
-                "forwardx11trusted" => {
-                    let _ = parse_bool(values[0]).with_context(|| {
-                        format!("invalid ForwardX11Trusted on line {line_number}")
-                    })?;
                 }
                 "pubkeyauthentication" => {
                     let enabled = parse_bool(values[0]).with_context(|| {
