@@ -31,6 +31,7 @@ NewConnectionsPerMinutePerIp 12
 NewConnectionsBurstPerIp 4
 LoginGraceTime 15s
 ClientBannerTimeout 5s
+KexStartTimeout 5s
 MaxAuthAttempts 4
 AuthRejectionTime 2s
 AuthFailureBanThreshold 8
@@ -116,6 +117,7 @@ pub struct AppConfig {
     pub new_connections_burst_per_ip: usize,
     pub login_grace_time: Duration,
     pub client_banner_timeout: Duration,
+    pub kex_start_timeout: Duration,
     pub max_auth_attempts: usize,
     pub auth_rejection_time: Duration,
     pub auth_failure_ban_threshold: usize,
@@ -175,6 +177,7 @@ impl AppConfig {
             new_connections_burst_per_ip: 4,
             login_grace_time: Duration::from_secs(15),
             client_banner_timeout: Duration::from_secs(5),
+            kex_start_timeout: Duration::from_secs(5),
             max_auth_attempts: 4,
             auth_rejection_time: Duration::from_secs(2),
             auth_failure_ban_threshold: 8,
@@ -296,6 +299,11 @@ impl AppConfig {
                 "clientbannertimeout" => {
                     self.client_banner_timeout = parse_duration(values[0]).with_context(|| {
                         format!("invalid ClientBannerTimeout on line {line_number}")
+                    })?;
+                }
+                "kexstarttimeout" => {
+                    self.kex_start_timeout = parse_duration(values[0]).with_context(|| {
+                        format!("invalid KexStartTimeout on line {line_number}")
                     })?;
                 }
                 "maxauthattempts" => {
@@ -522,6 +530,7 @@ mod tests {
         assert_eq!(config.listen_address, "127.0.0.1");
         assert_eq!(config.login_grace_time, Duration::from_secs(20));
         assert_eq!(config.authorized_keys_max_size, 64 * 1024);
+        assert_eq!(config.kex_start_timeout, Duration::from_secs(5));
     }
 
     #[test]
@@ -529,7 +538,7 @@ mod tests {
         let mut config = AppConfig::defaults().unwrap();
         config
             .apply_text(
-                "MaxUnauthConnectionsGlobal 10\nMaxUnauthConnectionsPerIp 2\nAuthFailureBanThreshold 5\nAuthFailureBanWindow 30s\nAuthorizedKeysReloadInterval 3s\n",
+                "MaxUnauthConnectionsGlobal 10\nMaxUnauthConnectionsPerIp 2\nAuthFailureBanThreshold 5\nAuthFailureBanWindow 30s\nAuthorizedKeysReloadInterval 3s\nKexStartTimeout 7s\n",
                 Path::new("/tmp"),
             )
             .unwrap();
@@ -542,6 +551,7 @@ mod tests {
             config.authorized_keys_reload_interval,
             Duration::from_secs(3)
         );
+        assert_eq!(config.kex_start_timeout, Duration::from_secs(7));
     }
 
     #[test]

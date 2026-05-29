@@ -1309,6 +1309,7 @@ dependencies = [
  "clap",
  "dirs",
  "env_logger",
+ "futures",
  "getrandom 0.4.2",
  "log",
  "nix 0.30.1",

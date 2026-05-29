@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -12,6 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use futures::FutureExt;
 use getrandom::rand_core::UnwrapErr;
 use log::{debug, error, info, warn};
 use nix::sys::signal::{Signal, kill, killpg};
@@ -34,6 +36,7 @@ use crate::authorized_keys::{
 };
 use crate::config::AppConfig;
 use crate::log_limiter::{LogDecision, LogKey, LogLimiter};
+use crate::metrics::ServerMetrics;
 use crate::sftp::LocalSftp;
 
 pub async fn run(config: AppConfig) -> Result<()> {
@@ -64,12 +67,30 @@ async fn run_with_listener(state: Arc<AppState>, listener: TcpListener) -> Resul
         let state = Arc::clone(&state);
         let ssh_config = Arc::clone(&ssh_config);
 
-        tokio::spawn(async move {
-            if let Err(err) = serve_connection(state, ssh_config, socket, peer_addr).await {
-                warn!("connection from {peer_addr} ended with error: {err:#}");
-            }
+        let _task = spawn_supervised_connection(peer_addr, async move {
+            serve_connection(state, ssh_config, socket, peer_addr).await
         });
     }
+}
+
+fn spawn_supervised_connection<F>(peer_addr: SocketAddr, future: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        match AssertUnwindSafe(future).catch_unwind().await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!("event=connection_error peer={peer_addr} error={err:#}");
+            }
+            Err(payload) => {
+                error!(
+                    "event=connection_panic peer={peer_addr} panic={:?}",
+                    panic_payload_message(payload.as_ref())
+                );
+            }
+        }
+    })
 }
 
 struct AppState {
@@ -80,6 +101,7 @@ struct AppState {
     authorized_keys: AuthorizedKeysStore,
     admission: AdmissionController,
     log_limiter: LogLimiter,
+    metrics: ServerMetrics,
 }
 
 impl AppState {
@@ -142,6 +164,7 @@ impl AppState {
         Ok(Self {
             admission: AdmissionController::new(AdmissionConfig::from_app_config(&config)),
             log_limiter: LogLimiter::new(Duration::from_secs(30), 4096),
+            metrics: ServerMetrics::new(4096),
             config,
             host_key,
             daemon_username,
@@ -166,37 +189,40 @@ impl AppState {
             } => {
                 if ignored_entries == 0 {
                     info!(
-                        "reloaded authorized_keys from {} as generation {}",
+                        "event=authorized_keys_reload result=success path={} generation={}",
                         self.config.authorized_keys_file.display(),
                         generation
                     );
                 } else {
                     warn!(
-                        "reloaded authorized_keys from {} as generation {}; ignored {} entr{} with unsupported options",
+                        "event=authorized_keys_reload result=success path={} generation={} ignored_entries={} message=\"ignored entr{} with unsupported options\"",
                         self.config.authorized_keys_file.display(),
                         generation,
                         ignored_entries,
                         if ignored_entries == 1 { "y" } else { "ies" }
                     );
                 }
+                self.metrics.record_cache_reload_success();
             }
             AuthorizedKeysReloadEvent::Missing => {
+                self.metrics.record_cache_reload_failure();
                 self.warn_limited(
                     None,
                     "authorized-keys-missing",
                     format!(
-                        "authorized keys file {} disappeared; keeping the last known-good in-memory cache",
+                        "event=authorized_keys_reload result=missing path={} message=\"keeping the last known-good in-memory cache\"",
                         self.config.authorized_keys_file.display()
                     ),
                 );
             }
             AuthorizedKeysReloadEvent::Failed(message) => {
+                self.metrics.record_cache_reload_failure();
                 self.warn_limited(
                     None,
                     "authorized-keys-reload-failed",
                     format!(
-                        "failed to reload authorized keys from {}; keeping the last known-good in-memory cache: {message}",
-                        self.config.authorized_keys_file.display()
+                        "event=authorized_keys_reload result=failure path={} message=\"keeping the last known-good in-memory cache\" error={message:?}",
+                        self.config.authorized_keys_file.display(),
                     ),
                 );
             }
@@ -226,6 +252,7 @@ struct PreauthContext {
     admission_guard: Option<AdmissionGuard>,
     auth_success_tx: Option<oneshot::Sender<()>>,
     authenticated: Arc<AtomicBool>,
+    metrics: ServerMetrics,
 }
 
 impl PreauthContext {
@@ -233,11 +260,14 @@ impl PreauthContext {
         admission_guard: AdmissionGuard,
         auth_success_tx: oneshot::Sender<()>,
         authenticated: Arc<AtomicBool>,
+        metrics: ServerMetrics,
     ) -> Self {
+        metrics.preauth_connection_opened();
         Self {
             admission_guard: Some(admission_guard),
             auth_success_tx: Some(auth_success_tx),
             authenticated,
+            metrics,
         }
     }
 
@@ -246,6 +276,7 @@ impl PreauthContext {
 
         if let Some(guard) = self.admission_guard.take() {
             guard.mark_authenticated();
+            self.metrics.preauth_connection_closed();
         }
 
         if let Some(tx) = self.auth_success_tx.take() {
@@ -254,20 +285,43 @@ impl PreauthContext {
     }
 }
 
-struct LoginGraceStream<S> {
+impl Drop for PreauthContext {
+    fn drop(&mut self) {
+        if self.admission_guard.take().is_some() {
+            self.metrics.preauth_connection_closed();
+        }
+    }
+}
+
+struct PreauthTimedStream<S> {
     inner: S,
-    deadline: TokioInstant,
+    login_grace_deadline: TokioInstant,
+    kex_start_timeout: Duration,
+    kex_start_deadline: Option<TokioInstant>,
+    kex_started: bool,
+    client_banner_complete: bool,
+    client_banner_len: usize,
     authenticated: Arc<AtomicBool>,
     timer: Pin<Box<Sleep>>,
 }
 
-impl<S> LoginGraceStream<S> {
-    fn new(inner: S, deadline: TokioInstant, authenticated: Arc<AtomicBool>) -> Self {
+impl<S> PreauthTimedStream<S> {
+    fn new(
+        inner: S,
+        login_grace_deadline: TokioInstant,
+        kex_start_timeout: Duration,
+        authenticated: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             inner,
-            deadline,
+            login_grace_deadline,
+            kex_start_timeout,
+            kex_start_deadline: None,
+            kex_started: false,
+            client_banner_complete: false,
+            client_banner_len: 0,
             authenticated,
-            timer: Box::pin(tokio::time::sleep_until(deadline)),
+            timer: Box::pin(tokio::time::sleep_until(login_grace_deadline)),
         }
     }
 
@@ -275,30 +329,90 @@ impl<S> LoginGraceStream<S> {
         self.authenticated.load(Ordering::Relaxed)
     }
 
-    fn preauth_timeout_error() -> IoError {
+    fn login_grace_timeout_error() -> IoError {
         IoError::new(
             ErrorKind::TimedOut,
             "login grace time exceeded before authentication completed",
         )
     }
 
-    fn poll_deadline(&mut self, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+    fn kex_start_timeout_error() -> IoError {
+        IoError::new(
+            ErrorKind::TimedOut,
+            "key exchange did not start before the configured timeout elapsed",
+        )
+    }
+
+    fn current_deadline(&self) -> TokioInstant {
+        match self.kex_start_deadline {
+            Some(deadline) if !self.kex_started => deadline.min(self.login_grace_deadline),
+            _ => self.login_grace_deadline,
+        }
+    }
+
+    fn reset_timer(&mut self) {
+        let deadline = self.current_deadline();
+        self.timer.as_mut().reset(deadline);
+    }
+
+    fn check_timeout(&self, now: TokioInstant) -> Option<IoError> {
         if self.is_authenticated() {
-            return Poll::Pending;
+            return None;
         }
 
-        if TokioInstant::now() >= self.deadline {
-            return Poll::Ready(Err(Self::preauth_timeout_error()));
+        if now >= self.login_grace_deadline {
+            return Some(Self::login_grace_timeout_error());
+        }
+
+        if let Some(deadline) = self.kex_start_deadline {
+            if !self.kex_started && now >= deadline {
+                return Some(Self::kex_start_timeout_error());
+            }
+        }
+
+        None
+    }
+
+    fn note_client_bytes(&mut self, bytes: &[u8]) {
+        if self.is_authenticated() || bytes.is_empty() {
+            return;
+        }
+
+        if !self.client_banner_complete {
+            for byte in bytes {
+                self.client_banner_len = self.client_banner_len.saturating_add(1);
+                if *byte == b'\n' {
+                    self.client_banner_complete = true;
+                    self.kex_start_deadline = Some(TokioInstant::now() + self.kex_start_timeout);
+                    self.reset_timer();
+                    break;
+                }
+            }
+            return;
+        }
+
+        if !self.kex_started {
+            self.kex_started = true;
+            self.kex_start_deadline = None;
+            self.reset_timer();
+        }
+    }
+
+    fn poll_deadline(&mut self, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        if let Some(err) = self.check_timeout(TokioInstant::now()) {
+            return Poll::Ready(Err(err));
         }
 
         match self.timer.as_mut().poll(cx) {
-            Poll::Ready(()) => Poll::Ready(Err(Self::preauth_timeout_error())),
+            Poll::Ready(()) => Poll::Ready(Err(self
+                .check_timeout(TokioInstant::now())
+                .unwrap_or_else(Self::login_grace_timeout_error))),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-impl<S> AsyncRead for LoginGraceStream<S>
+impl<S> AsyncRead for PreauthTimedStream<S>
 where
     S: AsyncRead + Unpin,
 {
@@ -311,18 +425,26 @@ where
             return Pin::new(&mut self.inner).poll_read(cx, buf);
         }
 
-        if TokioInstant::now() >= self.deadline {
-            return Poll::Ready(Err(Self::preauth_timeout_error()));
+        if let Some(err) = self.check_timeout(TokioInstant::now()) {
+            return Poll::Ready(Err(err));
         }
 
+        let filled_before = buf.filled().len();
         match Pin::new(&mut self.inner).poll_read(cx, buf) {
-            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Ready(Ok(())) => {
+                let filled_after = buf.filled().len();
+                if filled_after > filled_before {
+                    self.note_client_bytes(&buf.filled()[filled_before..filled_after]);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => self.poll_deadline(cx),
         }
     }
 }
 
-impl<S> AsyncWrite for LoginGraceStream<S>
+impl<S> AsyncWrite for PreauthTimedStream<S>
 where
     S: AsyncWrite + Unpin,
 {
@@ -335,8 +457,8 @@ where
             return Pin::new(&mut self.inner).poll_write(cx, buf);
         }
 
-        if TokioInstant::now() >= self.deadline {
-            return Poll::Ready(Err(Self::preauth_timeout_error()));
+        if let Some(err) = self.check_timeout(TokioInstant::now()) {
+            return Poll::Ready(Err(err));
         }
 
         match Pin::new(&mut self.inner).poll_write(cx, buf) {
@@ -354,8 +476,8 @@ where
             return Pin::new(&mut self.inner).poll_flush(cx);
         }
 
-        if TokioInstant::now() >= self.deadline {
-            return Poll::Ready(Err(Self::preauth_timeout_error()));
+        if let Some(err) = self.check_timeout(TokioInstant::now()) {
+            return Poll::Ready(Err(err));
         }
 
         match Pin::new(&mut self.inner).poll_flush(cx) {
@@ -381,10 +503,14 @@ async fn serve_connection(
     let admission_guard = match state.admission.try_acquire(peer_addr.ip()) {
         Ok(guard) => guard,
         Err(reason) => {
+            state.metrics.record_rejected_connection(reason.category());
             state.warn_limited(
                 Some(peer_addr),
                 reason.category(),
-                format!("rejected connection from {peer_addr}: {reason}"),
+                format!(
+                    "event=connection_rejected peer={peer_addr} reason={:?}",
+                    reason
+                ),
             );
             return Ok(());
         }
@@ -403,9 +529,19 @@ async fn serve_connection(
     let handler = ClientHandler::new(
         Arc::clone(&state),
         Some(peer_addr),
-        PreauthContext::new(admission_guard, auth_success_tx, Arc::clone(&authenticated)),
+        PreauthContext::new(
+            admission_guard,
+            auth_success_tx,
+            Arc::clone(&authenticated),
+            state.metrics.clone(),
+        ),
     );
-    let stream = LoginGraceStream::new(socket, login_deadline, authenticated);
+    let stream = PreauthTimedStream::new(
+        socket,
+        login_deadline,
+        state.config.kex_start_timeout,
+        authenticated,
+    );
 
     let running = match timeout(
         state.config.client_banner_timeout,
@@ -415,27 +551,36 @@ async fn serve_connection(
     {
         Ok(Ok(session)) => session,
         Ok(Err(err)) => {
-            if is_login_grace_timeout(&err) {
+            if let Some((kind, elapsed_ms)) = preauth_timeout_details(&state.config, &err) {
+                state.metrics.record_rejected_connection(kind);
+                state.metrics.record_preauth_timeout();
                 state.warn_limited(
                     Some(peer_addr),
-                    "login-grace-timeout",
+                    kind,
                     format!(
-                        "closing pre-auth connection from {peer_addr} after login grace timeout of {:?}",
-                        state.config.login_grace_time
+                        "event=preauth_timeout peer={peer_addr} kind={} elapsed_ms={}",
+                        kind, elapsed_ms
                     ),
                 );
+            } else if is_malformed_connection_error(&err) {
+                state
+                    .metrics
+                    .record_rejected_connection("malformed-disconnect");
+                state.metrics.record_malformed_disconnect();
             } else {
                 debug!("SSH setup from {peer_addr} failed before authentication: {err:#}");
             }
             return Ok(());
         }
         Err(_) => {
+            state.metrics.record_rejected_connection("banner-timeout");
+            state.metrics.record_preauth_timeout();
             state.warn_limited(
                 Some(peer_addr),
                 "banner-timeout",
                 format!(
-                    "timed out waiting for SSH banner from {peer_addr} after {:?}",
-                    state.config.client_banner_timeout
+                    "event=preauth_timeout peer={peer_addr} kind=banner elapsed_ms={}",
+                    state.config.client_banner_timeout.as_millis()
                 ),
             );
             return Ok(());
@@ -457,15 +602,21 @@ async fn serve_connection(
         }
         result = &mut running => {
             if let Err(ref err) = result {
-                if is_login_grace_timeout(err) {
+                if let Some((kind, elapsed_ms)) = preauth_timeout_details(&state.config, err) {
+                    state.metrics.record_rejected_connection(kind);
+                    state.metrics.record_preauth_timeout();
                     state.warn_limited(
                         Some(peer_addr),
-                        "login-grace-timeout",
+                        kind,
                         format!(
-                            "closing pre-auth connection from {peer_addr} after login grace timeout of {:?}",
-                            state.config.login_grace_time
+                            "event=preauth_timeout peer={peer_addr} kind={} elapsed_ms={}",
+                            kind,
+                            elapsed_ms
                         ),
                     );
+                } else if is_malformed_connection_error(err) {
+                    state.metrics.record_rejected_connection("malformed-disconnect");
+                    state.metrics.record_malformed_disconnect();
                 }
             }
             result?;
@@ -569,27 +720,27 @@ impl ClientHandler {
     }
 
     fn record_auth_failure(&self, user: &str, category: &'static str, reason: &str) {
-        let Some(peer_ip) = self.peer.map(|peer| peer.ip()) else {
+        let peer_ip = self.peer.map(|peer| peer.ip());
+        let Some(ip) = peer_ip else {
+            self.state.metrics.record_auth_failure(None, false);
             self.state.warn_limited(
                 self.peer,
                 category,
-                format!("rejected authentication for requested user {user}: {reason}"),
+                format!(
+                    "event=auth_rejected peer=<unknown> user={user:?} category={category} reason={reason:?}"
+                ),
             );
             return;
         };
 
-        let banned = self.state.admission.record_auth_failure(peer_ip);
-        let suffix = if banned {
-            "; peer temporarily banned"
-        } else {
-            ""
-        };
+        let banned = self.state.admission.record_auth_failure(ip);
+        self.state.metrics.record_auth_failure(peer_ip, banned);
         self.state.warn_limited(
             self.peer,
             category,
             format!(
-                "rejected authentication for requested user {user} from {}: {reason}{suffix}",
-                peer_label(self.peer)
+                "event=auth_rejected peer={} user={user:?} category={category} reason={reason:?} temporary_ban={banned}",
+                peer_label(self.peer),
             ),
         );
     }
@@ -634,9 +785,9 @@ impl server::Handler for ClientHandler {
     async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
         self.preauth.mark_authenticated();
         info!(
-            "session authenticated for requested user {} from {}",
-            self.requested_user.as_deref().unwrap_or("<unknown>"),
-            peer_label(self.peer)
+            "event=auth_success peer={} user={:?}",
+            peer_label(self.peer),
+            self.requested_user.as_deref().unwrap_or("<unknown>")
         );
         Ok(())
     }
@@ -1502,6 +1653,16 @@ fn peer_label(peer: Option<std::net::SocketAddr>) -> String {
         .unwrap_or_else(|| "<unknown peer>".to_string())
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 fn is_login_grace_timeout(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -1511,6 +1672,52 @@ fn is_login_grace_timeout(err: &anyhow::Error) -> bool {
                     && io_err
                         .to_string()
                         .contains("login grace time exceeded before authentication completed")
+            })
+    })
+}
+
+fn is_kex_start_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                io_err.kind() == ErrorKind::TimedOut
+                    && io_err.to_string().contains(
+                        "key exchange did not start before the configured timeout elapsed",
+                    )
+            })
+    })
+}
+
+fn preauth_timeout_details(
+    config: &AppConfig,
+    err: &anyhow::Error,
+) -> Option<(&'static str, u128)> {
+    if is_login_grace_timeout(err) {
+        Some(("login-grace-timeout", config.login_grace_time.as_millis()))
+    } else if is_kex_start_timeout(err) {
+        Some(("kex-start-timeout", config.kex_start_timeout.as_millis()))
+    } else {
+        None
+    }
+}
+
+fn is_malformed_connection_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<russh::Error>()
+            .is_some_and(|russh_err| {
+                matches!(
+                    russh_err,
+                    russh::Error::Version
+                        | russh::Error::PacketAuth
+                        | russh::Error::PacketSize(_)
+                        | russh::Error::DecryptionError
+                        | russh::Error::StrictKeyExchangeViolation { .. }
+                        | russh::Error::SshEncoding(_)
+                        | russh::Error::Inconsistent
+                        | russh::Error::KexInit
+                )
             })
     })
 }
@@ -1599,6 +1806,7 @@ mod tests {
                 authorized_keys_reload_interval,
             ),
             log_limiter: LogLimiter::new(Duration::from_secs(30), 64),
+            metrics: ServerMetrics::new(64),
         };
 
         let ssh_config = build_ssh_config(&state);
@@ -1662,6 +1870,18 @@ mod tests {
             ssh_config.preferred.compression.as_ref(),
             &[russh::compression::NONE]
         );
+    }
+
+    #[tokio::test]
+    async fn supervised_connection_tasks_isolate_panics() {
+        let peer: SocketAddr = "127.0.0.1:2222".parse().unwrap();
+        let handle = spawn_supervised_connection(peer, async move {
+            panic!("boom");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        assert!(handle.await.is_ok());
     }
 }
 

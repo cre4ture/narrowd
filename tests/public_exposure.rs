@@ -1,9 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use getrandom::rand_core::UnwrapErr;
+use log::{Level, LevelFilter, Log, Metadata, Record};
 use narrowd::config::AppConfig;
 use narrowd::sshd;
 use nix::unistd::{User, getuid};
@@ -17,6 +19,11 @@ use tokio::time::{Instant, sleep, timeout};
 
 struct AcceptAnyServerKey;
 
+struct TestLogger;
+
+static LOGGER_INIT: Once = Once::new();
+static LOG_ENTRIES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
 impl client::Handler for AcceptAnyServerKey {
     type Error = russh::Error;
 
@@ -26,6 +33,34 @@ impl client::Handler for AcceptAnyServerKey {
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
+}
+
+impl Log for TestLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.level() <= Level::Warn
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        if let Some(entries) = LOG_ENTRIES.get() {
+            entries.lock().unwrap().push(format!(
+                "{} {}",
+                match record.level() {
+                    Level::Error => "ERROR",
+                    Level::Warn => "WARN",
+                    Level::Info => "INFO",
+                    Level::Debug => "DEBUG",
+                    Level::Trace => "TRACE",
+                },
+                record.args()
+            ));
+        }
+    }
+
+    fn flush(&self) {}
 }
 
 #[tokio::test]
@@ -63,6 +98,27 @@ async fn closes_banner_only_clients_after_login_grace_time() -> Result<()> {
 
     // Allow the server to advance into KEX before we wait for the hard pre-auth deadline.
     let _ = read_some(&mut stream, Duration::from_millis(100)).await;
+
+    sleep(Duration::from_millis(250)).await;
+    wait_for_close(&mut stream, Duration::from_millis(400)).await?;
+
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn closes_banner_only_clients_after_kex_start_timeout() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let config = test_config(&tempdir, "", |config| {
+        config.client_banner_timeout = Duration::from_millis(500);
+        config.kex_start_timeout = Duration::from_millis(150);
+        config.login_grace_time = Duration::from_secs(2);
+    })?;
+    let (addr, task) = spawn_server(config).await?;
+
+    let mut stream = TcpStream::connect(addr).await?;
+    let _banner = read_banner(&mut stream).await?;
+    stream.write_all(b"SSH-2.0-test-client\r\n").await?;
 
     sleep(Duration::from_millis(250)).await;
     wait_for_close(&mut stream, Duration::from_millis(400)).await?;
@@ -137,6 +193,31 @@ async fn rejects_connections_over_global_unauth_limit_before_banner() -> Result<
 }
 
 #[tokio::test]
+async fn rejects_connections_over_per_ip_unauth_limit_before_banner() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let config = test_config(&tempdir, "", |config| {
+        config.max_unauth_connections_global = 8;
+        config.max_unauth_connections_per_ip = 1;
+        config.max_unauth_connections_per_subnet = 8;
+        config.new_connections_per_minute_per_ip = 60;
+        config.new_connections_burst_per_ip = 8;
+        config.client_banner_timeout = Duration::from_secs(1);
+        config.login_grace_time = Duration::from_secs(1);
+    })?;
+    let (addr, task) = spawn_server(config).await?;
+
+    let mut first = TcpStream::connect(addr).await?;
+    let banner = read_banner(&mut first).await?;
+    assert!(banner.starts_with(b"SSH-2.0-"));
+
+    let mut second = TcpStream::connect(addr).await?;
+    expect_close_without_banner(&mut second, Duration::from_millis(300)).await?;
+
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn repeated_auth_failures_trigger_temporary_bans() -> Result<()> {
     let tempdir = TempDir::new()?;
     let good_key = generate_ed25519_key()?;
@@ -176,6 +257,73 @@ async fn repeated_auth_failures_trigger_temporary_bans() -> Result<()> {
     sleep(Duration::from_millis(650)).await;
     let mut recovered = TcpStream::connect(addr).await?;
     let banner = read_banner(&mut recovered).await?;
+    assert!(banner.starts_with(b"SSH-2.0-"));
+
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_auth_rejects_are_log_limited() -> Result<()> {
+    install_test_logger();
+    clear_test_logs();
+
+    let tempdir = TempDir::new()?;
+    let wrong_key = Arc::new(generate_ed25519_key()?);
+    let config = test_config(&tempdir, "", |config| {
+        config.client_banner_timeout = Duration::from_millis(500);
+        config.login_grace_time = Duration::from_secs(1);
+        config.auth_failure_ban_threshold = 64;
+        config.new_connections_per_minute_per_ip = 120;
+        config.new_connections_burst_per_ip = 16;
+    })?;
+    let (addr, task) = spawn_server(config).await?;
+    let wrong_user = "wrong-user-log-limit-test";
+
+    for _ in 0..5 {
+        let mut session = connect_client(addr).await?;
+        let auth = session
+            .authenticate_publickey(
+                wrong_user,
+                PrivateKeyWithHashAlg::new(Arc::clone(&wrong_key), None),
+            )
+            .await?;
+        assert!(!auth.success(), "wrong username should not authenticate");
+    }
+
+    let matching_logs = test_logs()
+        .into_iter()
+        .filter(|entry| {
+            entry.contains("event=auth_rejected")
+                && entry.contains("category=auth-reject-username")
+                && entry.contains("wrong-user-log-limit-test")
+        })
+        .count();
+
+    assert_eq!(matching_logs, 1, "expected only the first repeated auth warning to be logged");
+
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_preauth_packets_do_not_kill_the_listener() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let config = test_config(&tempdir, "", |config| {
+        config.client_banner_timeout = Duration::from_millis(500);
+        config.kex_start_timeout = Duration::from_secs(1);
+        config.login_grace_time = Duration::from_secs(1);
+    })?;
+    let (addr, task) = spawn_server(config).await?;
+
+    let mut malformed = TcpStream::connect(addr).await?;
+    let _banner = read_banner(&mut malformed).await?;
+    malformed.write_all(b"SSH-2.0-test-client\r\n").await?;
+    malformed.write_all(&[0, 0, 0, 0, 0]).await?;
+    wait_for_close(&mut malformed, Duration::from_millis(400)).await?;
+
+    let mut healthy = TcpStream::connect(addr).await?;
+    let banner = read_banner(&mut healthy).await?;
     assert!(banner.starts_with(b"SSH-2.0-"));
 
     task.abort();
@@ -337,6 +485,28 @@ async fn authenticate_with_key(addr: SocketAddr, key: Arc<PrivateKey>) -> Result
         .map_err(anyhow::Error::from)?;
 
     Ok(auth.success())
+}
+
+fn install_test_logger() {
+    let entries = LOG_ENTRIES.get_or_init(|| Mutex::new(Vec::new()));
+    LOGGER_INIT.call_once(|| {
+        log::set_boxed_logger(Box::new(TestLogger)).expect("failed to install test logger");
+        log::set_max_level(LevelFilter::Trace);
+    });
+    entries.lock().unwrap().clear();
+}
+
+fn clear_test_logs() {
+    if let Some(entries) = LOG_ENTRIES.get() {
+        entries.lock().unwrap().clear();
+    }
+}
+
+fn test_logs() -> Vec<String> {
+    LOG_ENTRIES
+        .get()
+        .map(|entries| entries.lock().unwrap().clone())
+        .unwrap_or_default()
 }
 
 fn generate_ed25519_key() -> Result<PrivateKey> {

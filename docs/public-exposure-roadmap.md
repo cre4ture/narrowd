@@ -84,7 +84,7 @@ Attack styles mitigated:
 
 - [x] Add an absolute `LoginGraceTime` equivalent of `15s` from TCP accept to successful authentication.
 - [x] Add a `5s` timeout to receive the client SSH identification string.
-- [ ] Add a `5s` timeout from banner exchange to key-exchange start.
+- [x] Add a `5s` timeout from banner exchange to key-exchange start.
 - [x] Keep the timeout absolute. Do not let the client extend it indefinitely by trickling bytes.
 - [x] Close pre-auth connections that stall during banner, KEX, or authentication.
 
@@ -185,14 +185,14 @@ Attack styles mitigated:
 
 - [x] Rate-limit warning logs per IP and per reason.
 - [x] Aggregate repeated failures into summary events instead of emitting one warning per packet or per failed attempt.
-- [ ] Record counters for current unauthenticated connections.
-- [ ] Record counters for rejected connections by reason.
-- [ ] Record counters for auth failures by IP.
-- [ ] Record counters for temporary bans issued.
-- [ ] Record counters for pre-auth timeouts.
-- [ ] Record counters for malformed packet disconnects.
-- [ ] Record counters for cache reload success and failure.
-- [ ] Emit structured fields such as peer IP, reason, username, and elapsed pre-auth time.
+- [x] Record counters for current unauthenticated connections.
+- [x] Record counters for rejected connections by reason.
+- [x] Record counters for auth failures by IP.
+- [x] Record counters for temporary bans issued.
+- [x] Record counters for pre-auth timeouts.
+- [x] Record counters for malformed packet disconnects.
+- [x] Record counters for cache reload success and failure.
+- [x] Emit structured fields such as peer IP, reason, username, and elapsed pre-auth time.
 
 Suggested implementation notes:
 
@@ -232,7 +232,7 @@ Attack styles mitigated:
 - [x] Make sure one bad connection cannot crash the whole daemon.
 - [x] Isolate per-connection failures so malformed input results in connection teardown, not process exit.
 - [x] Add a small outer supervisor that logs connection-level crashes and keeps the main listener alive.
-- [ ] Prefer dropping the offending connection over attempting complicated recovery inside corrupted connection state.
+- [x] Prefer dropping the offending connection over attempting complicated recovery inside corrupted connection state.
 
 Attack styles mitigated:
 
@@ -275,17 +275,17 @@ These are explicitly out of scope for this roadmap:
 - [x] Phase 4: narrow crypto and auth surface
 - [x] Phase 5: bounded buffers and log hardening
 - [ ] Phase 6: pre-auth exploit containment split
-- [ ] Phase 7: panic isolation and attack-focused integration tests
+- [x] Phase 7: panic isolation and attack-focused integration tests
 
 ## Testing Expectations For The Hardened Design
 
 - [x] integration test for global unauthenticated connection cap
-- [ ] integration test for per-IP unauthenticated cap
+- [x] integration test for per-IP unauthenticated cap
 - [x] integration test for per-IP rate limiting and ban expiry
 - [x] integration test for slow banner timeout
-- [ ] integration test for slow KEX timeout
+- [x] integration test for slow KEX timeout
 - [x] integration test for absolute login grace timeout
 - [x] integration test that auth attempts do not touch disk after cache warm-up
 - [x] integration test for cache reload success and failed-reload fallback
-- [ ] integration test for malformed auth spam not producing unbounded logs
+- [x] integration test for malformed auth spam not producing unbounded logs
 - [x] integration test that a crashing connection does not kill the listener
