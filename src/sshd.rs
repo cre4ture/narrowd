@@ -1345,10 +1345,30 @@ fn is_user_key_algorithm_allowed(algorithm: &ssh_key::Algorithm) -> bool {
 
 fn public_exposure_preferred() -> russh::Preferred {
     let mut preferred = russh::Preferred::default();
+    preferred.kex = Cow::Owned(vec![
+        russh::kex::MLKEM768X25519_SHA256,
+        russh::kex::CURVE25519,
+        russh::kex::CURVE25519_PRE_RFC_8731,
+        russh::kex::EXTENSION_SUPPORT_AS_SERVER,
+        russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER,
+    ]);
     preferred.key = Cow::Owned(vec![
         ssh_key::Algorithm::Ed25519,
         ssh_key::Algorithm::SkEd25519,
     ]);
+    preferred.cipher = Cow::Owned(vec![
+        russh::cipher::CHACHA20_POLY1305,
+        russh::cipher::AES_256_GCM,
+        russh::cipher::AES_256_CTR,
+        russh::cipher::AES_128_CTR,
+    ]);
+    preferred.mac = Cow::Owned(vec![
+        russh::mac::HMAC_SHA512_ETM,
+        russh::mac::HMAC_SHA256_ETM,
+        russh::mac::HMAC_SHA512,
+        russh::mac::HMAC_SHA256,
+    ]);
+    preferred.compression = Cow::Owned(vec![russh::compression::NONE]);
     preferred
 }
 
@@ -1480,6 +1500,42 @@ mod tests {
         assert_eq!(ssh_config.window_size, 123_456);
         assert_eq!(ssh_config.maximum_packet_size, 16_384);
         assert!(!ssh_config.nodelay);
+        assert_eq!(
+            ssh_config.preferred.kex.as_ref(),
+            &[
+                russh::kex::MLKEM768X25519_SHA256,
+                russh::kex::CURVE25519,
+                russh::kex::CURVE25519_PRE_RFC_8731,
+                russh::kex::EXTENSION_SUPPORT_AS_SERVER,
+                russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER,
+            ]
+        );
+        assert_eq!(
+            ssh_config.preferred.key.as_ref(),
+            &[ssh_key::Algorithm::Ed25519, ssh_key::Algorithm::SkEd25519,]
+        );
+        assert_eq!(
+            ssh_config.preferred.cipher.as_ref(),
+            &[
+                russh::cipher::CHACHA20_POLY1305,
+                russh::cipher::AES_256_GCM,
+                russh::cipher::AES_256_CTR,
+                russh::cipher::AES_128_CTR,
+            ]
+        );
+        assert_eq!(
+            ssh_config.preferred.mac.as_ref(),
+            &[
+                russh::mac::HMAC_SHA512_ETM,
+                russh::mac::HMAC_SHA256_ETM,
+                russh::mac::HMAC_SHA512,
+                russh::mac::HMAC_SHA256,
+            ]
+        );
+        assert_eq!(
+            ssh_config.preferred.compression.as_ref(),
+            &[russh::compression::NONE]
+        );
     }
 }
 

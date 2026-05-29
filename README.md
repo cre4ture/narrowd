@@ -29,6 +29,8 @@ Security model / exposure guidance:
 - A successful login gets shell, `exec`, SFTP, and forwarding access as the daemon process user. This is intentional for the single-user design.
 - The SSH login username must exactly match the daemon process user's account name. Other usernames are rejected instead of being silently mapped to the daemon user.
 - The public exposure profile only accepts modern Ed25519-family SSH keys for both the host key and user authentication keys.
+- The public exposure profile also keeps a narrow SSH transport surface: modern KEX only, modern ciphers/MACs only, and no SSH compression.
+- Pre-auth resource controls are built in for public exposure: global/per-IP/per-subnet unauthenticated connection caps, per-IP new-connection rate limiting, temporary bans after repeated auth failures, a short client-banner timeout, and an absolute login grace deadline that also covers KEX stalls.
 - SFTP is not chrooted or confined to a separate subtree. It follows the filesystem permissions of the daemon process user. If that same user is intentionally allowed shell access, this does not expand privileges beyond that account.
 - `authorized_keys` is used for key matching, but `narrowd` only accepts plain key lines. Entries that include OpenSSH key options such as `command=`, `from=`, or no-forwarding flags are completely rejected instead of being interpreted as unrestricted keys.
 - TCP forwarding is deliberately permissive when enabled. This is useful for trusted personal access, but it also means accepted keys can use the host as a tunnel endpoint.
