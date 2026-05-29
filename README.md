@@ -86,3 +86,18 @@ The generated package is intentionally set up for a `systemd --user` service,
 not a root-owned system daemon. The packaged launcher refuses to start as
 `root`, so the SSH session, SFTP access, and port forwarding all run with the
 permissions of the target login account.
+
+RDP over SSH tunnel:
+
+```bash
+ssh -N -T -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:13389:127.0.0.1:3389 \
+  -p 2222 \
+  your-login-user@narrowd-host
+```
+
+Then connect your RDP client to `127.0.0.1:13389`.
+
+If the Windows machine is not the same host that runs `narrowd`, replace the
+target side of the `-L` argument with the address that is reachable from the
+`narrowd` host, for example `-L 127.0.0.1:13389:10.0.0.50:3389`.
