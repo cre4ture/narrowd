@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use narrowd::config::{self, AppConfig, SAMPLE_CONFIG};
 use narrowd::executor;
+use narrowd::sandbox;
 use narrowd::sshd;
 
 #[derive(Debug, Parser)]
@@ -28,6 +29,10 @@ struct Cli {
     /// Control fd inherited by the internal executor process.
     #[arg(long, hide = true)]
     control_fd: Option<i32>,
+
+    /// Internal pre-auth sandbox probe mode.
+    #[arg(long, hide = true)]
+    internal_preauth_sandbox_probe: Option<PathBuf>,
 }
 
 fn init_logging(level: config::LogLevel) {
@@ -41,7 +46,7 @@ fn init_logging(level: config::LogLevel) {
     builder.init();
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -50,6 +55,11 @@ async fn main() -> Result<()> {
             .control_fd
             .context("missing --control-fd for --internal-executor mode")?;
         return executor::run_from_control_fd(control_fd).await;
+    }
+
+    if let Some(probe_path) = cli.internal_preauth_sandbox_probe {
+        print!("{}", sandbox::internal_preauth_probe(&probe_path)?);
+        return Ok(());
     }
 
     if cli.print_sample_config {

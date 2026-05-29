@@ -35,10 +35,10 @@ use crate::executor::{
 };
 use crate::log_limiter::{LogDecision, LogKey, LogLimiter};
 use crate::metrics::ServerMetrics;
+use crate::sandbox;
 
 pub async fn run(config: AppConfig) -> Result<()> {
     let state = Arc::new(AppState::bootstrap(config)?);
-    enable_no_new_privs()?;
 
     info!(
         "starting narrowd on {}:{} with host key {}",
@@ -49,6 +49,8 @@ pub async fn run(config: AppConfig) -> Result<()> {
 
     let listener =
         TcpListener::bind((state.config.listen_address.as_str(), state.config.port)).await?;
+    sandbox::enable_no_new_privs()?;
+    sandbox::apply_preauth_sandbox(&state.config.authorized_keys_file)?;
     run_with_listener(state, listener).await
 }
 
@@ -1353,21 +1355,6 @@ fn to_executor_pty_request(pty: &PtyRequest) -> SerializablePtyRequest {
             pixel_height: pty.size.pixel_height,
         },
     }
-}
-
-#[cfg(target_os = "linux")]
-fn enable_no_new_privs() -> Result<()> {
-    let result = unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().into())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn enable_no_new_privs() -> Result<()> {
-    Ok(())
 }
 
 fn daemon_username() -> Result<String> {

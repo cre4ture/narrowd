@@ -205,6 +205,7 @@ async fn main_binary_sets_no_new_privs_only_on_the_preauth_process() -> Result<(
     let server_status = std::fs::read_to_string(format!("/proc/{}/status", server.pid()))
         .context("failed to read server /proc status")?;
     assert_eq!(parse_no_new_privs(&server_status), Some(1));
+    assert_eq!(parse_seccomp_mode(&server_status), Some(2));
 
     let result = exec_with_key(
         addr,
@@ -216,6 +217,35 @@ async fn main_binary_sets_no_new_privs_only_on_the_preauth_process() -> Result<(
     assert_eq!(parse_no_new_privs(&result.stdout), Some(0));
 
     server.stop()?;
+    Ok(())
+}
+
+#[test]
+fn internal_preauth_sandbox_probe_blocks_writes_and_exec() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let probe_path = tempdir.path().join("authorized_keys");
+    std::fs::write(&probe_path, "probe-key\n")
+        .with_context(|| format!("failed to write {}", probe_path.display()))?;
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_narrowd"))
+        .arg("--internal-preauth-sandbox-probe")
+        .arg(&probe_path)
+        .output()
+        .context("failed to run internal pre-auth sandbox probe")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "sandbox probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("probe stdout was not valid UTF-8")?;
+    assert_eq!(parse_probe_flag(&stdout, "read_ok"), Some(1));
+    assert_eq!(parse_probe_flag(&stdout, "write_denied"), Some(1));
+    assert_eq!(parse_probe_flag(&stdout, "exec_denied"), Some(1));
+    assert_eq!(parse_probe_flag(&stdout, "seccomp_mode"), Some(2));
     Ok(())
 }
 
@@ -702,6 +732,18 @@ async fn wait_for_binary_server(addr: SocketAddr) -> Result<()> {
 fn parse_no_new_privs(text: &str) -> Option<u32> {
     text.lines()
         .find_map(|line| line.strip_prefix("NoNewPrivs:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+fn parse_seccomp_mode(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("Seccomp:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+fn parse_probe_flag(text: &str, key: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
         .and_then(|value| value.trim().parse().ok())
 }
 

@@ -211,8 +211,8 @@ Attack styles mitigated:
 - [x] Use a Unix socket or similar IPC to hand off "authenticated and approved" session requests.
 - [x] Ensure the pre-auth side cannot directly spawn shells, open PTYs, or touch user session state.
 - [x] Run the pre-auth side with `no_new_privs`.
-- [ ] Apply seccomp or equivalent syscall filtering to the pre-auth side.
-- [ ] Make the pre-auth side filesystem access read-only except for what is strictly needed.
+- [x] Apply seccomp or equivalent syscall filtering to the pre-auth side.
+- [x] Make the pre-auth side filesystem access read-only except for what is strictly needed.
 - [x] Limit address families on the pre-auth side to what it actually needs.
 - [x] Keep the post-auth side out of the network parser's direct process boundary.
 
@@ -289,3 +289,5 @@ These are explicitly out of scope for this roadmap:
 - [x] integration test for cache reload success and failed-reload fallback
 - [x] integration test for malformed auth spam not producing unbounded logs
 - [x] integration test that a crashing connection does not kill the listener
+- [x] binary-level test that the pre-auth server process reports `Seccomp: 2` and `NoNewPrivs: 1`
+- [x] binary-level test that the sandbox still allows reading `authorized_keys` while denying writes and `exec`
