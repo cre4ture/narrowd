@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $(id -u) -eq 0 ]]; then
+    printf '%s\n' 'narrowd.service from this package must run as a non-root user service.' >&2
+    printf '%s\n' 'Use systemctl --user enable --now narrowd.service from the target account.' >&2
+    exit 1
+fi
+
+exec /usr/bin/narrowd

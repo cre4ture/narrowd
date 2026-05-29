@@ -70,3 +70,19 @@ cargo run
 By default `narrowd` looks for `~/.config/narrowd/narrowd.conf`, generates an
 Ed25519 host key if one does not exist yet, and authenticates against
 `~/.ssh/authorized_keys`.
+
+Local Debian package:
+
+```bash
+./scripts/build-deb.sh
+sudo apt install ./target/debian/narrowd_*.deb
+mkdir -p ~/.config/narrowd
+cp /usr/share/doc/narrowd/examples/narrowd.conf.example ~/.config/narrowd/narrowd.conf
+sudo loginctl enable-linger "$USER"
+systemctl --user enable --now narrowd.service
+```
+
+The generated package is intentionally set up for a `systemd --user` service,
+not a root-owned system daemon. The packaged launcher refuses to start as
+`root`, so the SSH session, SFTP access, and port forwarding all run with the
+permissions of the target login account.

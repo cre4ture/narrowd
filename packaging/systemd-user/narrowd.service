@@ -1,0 +1,15 @@
+[Unit]
+Description=narrowd single-user SSH daemon
+Documentation=file:/usr/share/doc/narrowd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/narrowd/narrowd-user-service
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=default.target
