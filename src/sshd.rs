@@ -1,10 +1,10 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use getrandom::rand_core::UnwrapErr;
@@ -16,13 +16,13 @@ use portable_pty::{
 };
 use russh::keys::{Algorithm, PrivateKey, ssh_key};
 use russh::server::{self, Auth, Msg, Server as _, Session};
-use russh::{Channel, ChannelId, ChannelMsg, Sig};
-use ssh_key::AuthorizedKeys;
+use russh::{Channel, ChannelId, ChannelMsg, MethodKind, MethodSet, Sig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::authorized_keys::AuthorizedKeysCache;
 use crate::config::AppConfig;
 use crate::sftp::LocalSftp;
 
@@ -41,15 +41,10 @@ pub async fn run(config: AppConfig) -> Result<()> {
         state: Arc::clone(&state),
     };
 
-    let ssh_config = server::Config {
-        auth_rejection_time: Duration::from_secs(3),
-        auth_rejection_time_initial: Some(Duration::ZERO),
-        keys: vec![state.host_key.clone()],
-        ..Default::default()
-    };
+    let ssh_config = Arc::new(build_ssh_config(&state));
 
     server
-        .run_on_address(Arc::new(ssh_config), bind_target)
+        .run_on_address(ssh_config, bind_target)
         .await
         .map_err(Into::into)
 }
@@ -59,11 +54,7 @@ struct AppState {
     host_key: PrivateKey,
     daemon_username: String,
     home_dir: PathBuf,
-}
-
-struct AuthorizedKeyLookup {
-    matched: bool,
-    ignored_entries: usize,
+    authorized_keys: AuthorizedKeysCache,
 }
 
 impl AppState {
@@ -71,10 +62,42 @@ impl AppState {
         let home_dir = dirs::home_dir().context("unable to determine home directory")?;
         let host_key = load_or_generate_host_key(&config.host_key)?;
         let daemon_username = daemon_username()?;
+        let authorized_keys = match AuthorizedKeysCache::load(
+            &config.authorized_keys_file,
+            config.authorized_keys_max_size,
+            config.authorized_keys_max_entries,
+        ) {
+            Ok(cache) => cache,
+            Err(err) if !config.authorized_keys_file.exists() => {
+                warn!(
+                    "authorized keys file {} does not exist yet; all public-key auth will be rejected until it is created",
+                    config.authorized_keys_file.display()
+                );
+                debug!(
+                    "authorized keys file {} missing: {err}",
+                    config.authorized_keys_file.display()
+                );
+                AuthorizedKeysCache::empty()
+            }
+            Err(err) => return Err(err),
+        };
 
-        if !config.authorized_keys_file.exists() {
+        if host_key.algorithm() != ssh_key::Algorithm::Ed25519 {
+            anyhow::bail!(
+                "host key {} must be an Ed25519 key for the public exposure profile",
+                config.host_key.display()
+            );
+        }
+
+        if authorized_keys.ignored_entries() > 0 {
             warn!(
-                "authorized keys file {} does not exist yet; all public-key auth will be rejected until it is created",
+                "ignoring {} authorized_keys entr{} with unsupported options in {}; narrowd accepts only plain key lines",
+                authorized_keys.ignored_entries(),
+                if authorized_keys.ignored_entries() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
                 config.authorized_keys_file.display()
             );
         }
@@ -84,75 +107,13 @@ impl AppState {
             host_key,
             daemon_username,
             home_dir,
+            authorized_keys,
         })
     }
 
     fn is_authorized(&self, offered_key: &ssh_key::PublicKey) -> Result<bool> {
-        let authorized_keys_text = match std::fs::read_to_string(&self.config.authorized_keys_file)
-        {
-            Ok(text) => text,
-            Err(err) if !self.config.authorized_keys_file.exists() => {
-                debug!(
-                    "authorized keys file {} missing: {err}",
-                    self.config.authorized_keys_file.display()
-                );
-                return Ok(false);
-            }
-            Err(err) => {
-                return Err(anyhow!(
-                    "failed to read {}: {err}",
-                    self.config.authorized_keys_file.display()
-                ));
-            }
-        };
-
-        let lookup = lookup_authorized_key(&authorized_keys_text, offered_key).map_err(|err| {
-            anyhow!(
-                "failed to parse {}: {err}",
-                self.config.authorized_keys_file.display()
-            )
-        })?;
-
-        if lookup.ignored_entries > 0 {
-            let label = if lookup.ignored_entries == 1 {
-                "entry"
-            } else {
-                "entries"
-            };
-            warn!(
-                "ignoring {} authorized_keys {} with unsupported options in {}; narrowd accepts only plain key lines",
-                lookup.ignored_entries,
-                label,
-                self.config.authorized_keys_file.display()
-            );
-        }
-
-        Ok(lookup.matched)
+        self.authorized_keys.contains(offered_key)
     }
-}
-
-fn lookup_authorized_key(
-    authorized_keys_text: &str,
-    offered_key: &ssh_key::PublicKey,
-) -> std::result::Result<AuthorizedKeyLookup, ssh_key::Error> {
-    let mut matched = false;
-    let mut ignored_entries = 0;
-
-    for entry in AuthorizedKeys::new(authorized_keys_text) {
-        let entry = entry?;
-        if entry.config_opts().is_empty() {
-            if entry.public_key().key_data() == offered_key.key_data() {
-                matched = true;
-            }
-        } else {
-            ignored_entries += 1;
-        }
-    }
-
-    Ok(AuthorizedKeyLookup {
-        matched,
-        ignored_entries,
-    })
 }
 
 #[derive(Clone)]
@@ -212,6 +173,15 @@ impl ClientHandler {
                 "rejected public key for requested user {user} from {}; narrowd only accepts the daemon user {}",
                 peer_label(self.peer),
                 self.state.daemon_username
+            );
+            return Ok(Auth::reject());
+        }
+
+        if !is_user_key_algorithm_allowed(&public_key.algorithm()) {
+            warn!(
+                "rejected public key using unsupported algorithm {:?} for requested user {user} from {}",
+                public_key.algorithm(),
+                peer_label(self.peer)
             );
             return Ok(Auth::reject());
         }
@@ -1038,6 +1008,26 @@ fn load_or_generate_host_key(path: &PathBuf) -> Result<PrivateKey> {
     Ok(key)
 }
 
+fn build_ssh_config(state: &AppState) -> server::Config {
+    server::Config {
+        methods: MethodSet::from(&[MethodKind::PublicKey][..]),
+        auth_rejection_time: state.config.auth_rejection_time,
+        auth_rejection_time_initial: Some(state.config.auth_rejection_time),
+        keys: vec![state.host_key.clone()],
+        preferred: public_exposure_preferred(),
+        max_auth_attempts: state.config.max_auth_attempts,
+        inactivity_timeout: Some(state.config.inactivity_timeout),
+        keepalive_interval: Some(state.config.keepalive_interval),
+        keepalive_max: state.config.keepalive_max,
+        nodelay: state.config.nodelay,
+        channel_buffer_size: state.config.channel_buffer_size,
+        event_buffer_size: state.config.event_buffer_size,
+        window_size: state.config.window_size,
+        maximum_packet_size: state.config.maximum_packet_size,
+        ..Default::default()
+    }
+}
+
 fn build_child_env(
     state: &AppState,
     requested_env: &BTreeMap<String, String>,
@@ -1078,6 +1068,22 @@ fn daemon_username() -> Result<String> {
 
 fn login_user_matches_daemon(requested_user: &str, daemon_username: &str) -> bool {
     requested_user == daemon_username
+}
+
+fn is_user_key_algorithm_allowed(algorithm: &ssh_key::Algorithm) -> bool {
+    matches!(
+        algorithm,
+        ssh_key::Algorithm::Ed25519 | ssh_key::Algorithm::SkEd25519
+    )
+}
+
+fn public_exposure_preferred() -> russh::Preferred {
+    let mut preferred = russh::Preferred::default();
+    preferred.key = Cow::Owned(vec![
+        ssh_key::Algorithm::Ed25519,
+        ssh_key::Algorithm::SkEd25519,
+    ]);
+    preferred
 }
 
 fn is_env_allowed(name: &str) -> bool {
@@ -1128,34 +1134,72 @@ fn send_signal_to_process_group(group: i32, signal: Signal) -> Result<()> {
 mod tests {
     use super::*;
 
-    const PLAIN_ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti user@example.com";
-    const OPTIONED_RSA_ENTRY: &str = "from=\"10.0.0.?,*.example.com\",no-X11-forwarding ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC0WRHtxuxefSJhpIxGq4ibGFgwYnESPm8C3JFM88A1JJLoprenklrd7VJ+VH3Ov/bQwZwLyRU5dRmfR/SWTtIPWs7tToJVayKKDB+/qoXmM5ui/0CU2U4rCdQ6PdaCJdC7yFgpPL8WexjWN06+eSIKYz1AAXbx9rRv1iasslK/KUqtsqzVliagI6jl7FPO2GhRZMcso6LsZGgSxuYf/Lp0D/FcBU8GkeOo1Sx5xEt8H8bJcErtCe4Blb8JxcW6EXO3sReb4z+zcR07gumPgFITZ6hDA8sSNuvo/AlWg0IKTeZSwHHVknWdQqDJ0uczE837caBxyTZllDNIGkBjCIIOFzuTT76HfYc/7CTTGk07uaNkUFXKN79xDiFOX8JQ1ZZMZvGOTwWjuT9CqgdTvQRORbRWwOYv3MH8re9ykw3Ip6lrPifY7s6hOaAKry/nkGPMt40m1TdiW98MTIpooE7W+WXu96ax2l2OJvxX8QR7l+LFlKnkIEEJd/ItF1G22UmOjkVwNASTwza/hlY+8DoVvEmwum/nMgH2TwQT3bTQzF9s9DOJkH4d8p4Mw4gEDjNx0EgUFA91ysCAeUMQQyIvuR8HXXa+VcvhOOO5mmBcVhxJ3qUOJTyDBsT0932Zb4mNtkxdigoVxu+iiwk0vwtvKwGVDYdyMP5EAQeEIP1t0w== user4@example.com";
-    const PLAIN_RSA_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC0WRHtxuxefSJhpIxGq4ibGFgwYnESPm8C3JFM88A1JJLoprenklrd7VJ+VH3Ov/bQwZwLyRU5dRmfR/SWTtIPWs7tToJVayKKDB+/qoXmM5ui/0CU2U4rCdQ6PdaCJdC7yFgpPL8WexjWN06+eSIKYz1AAXbx9rRv1iasslK/KUqtsqzVliagI6jl7FPO2GhRZMcso6LsZGgSxuYf/Lp0D/FcBU8GkeOo1Sx5xEt8H8bJcErtCe4Blb8JxcW6EXO3sReb4z+zcR07gumPgFITZ6hDA8sSNuvo/AlWg0IKTeZSwHHVknWdQqDJ0uczE837caBxyTZllDNIGkBjCIIOFzuTT76HfYc/7CTTGk07uaNkUFXKN79xDiFOX8JQ1ZZMZvGOTwWjuT9CqgdTvQRORbRWwOYv3MH8re9ykw3Ip6lrPifY7s6hOaAKry/nkGPMt40m1TdiW98MTIpooE7W+WXu96ax2l2OJvxX8QR7l+LFlKnkIEEJd/ItF1G22UmOjkVwNASTwza/hlY+8DoVvEmwum/nMgH2TwQT3bTQzF9s9DOJkH4d8p4Mw4gEDjNx0EgUFA91ysCAeUMQQyIvuR8HXXa+VcvhOOO5mmBcVhxJ3qUOJTyDBsT0932Zb4mNtkxdigoVxu+iiwk0vwtvKwGVDYdyMP5EAQeEIP1t0w== user4@example.com";
-
-    #[test]
-    fn matches_plain_authorized_key_entries() {
-        let offered_key: ssh_key::PublicKey = PLAIN_ED25519_KEY.parse().unwrap();
-
-        let lookup = lookup_authorized_key(PLAIN_ED25519_KEY, &offered_key).unwrap();
-
-        assert!(lookup.matched);
-        assert_eq!(lookup.ignored_entries, 0);
-    }
-
-    #[test]
-    fn ignores_authorized_key_entries_with_options() {
-        let offered_key: ssh_key::PublicKey = PLAIN_RSA_KEY.parse().unwrap();
-
-        let lookup = lookup_authorized_key(OPTIONED_RSA_ENTRY, &offered_key).unwrap();
-
-        assert!(!lookup.matched);
-        assert_eq!(lookup.ignored_entries, 1);
-    }
-
     #[test]
     fn rejects_non_matching_login_usernames() {
         assert!(login_user_matches_daemon("uli", "uli"));
         assert!(!login_user_matches_daemon("root", "uli"));
+    }
+
+    #[test]
+    fn allows_only_modern_user_key_algorithms() {
+        assert!(is_user_key_algorithm_allowed(&ssh_key::Algorithm::Ed25519));
+        assert!(is_user_key_algorithm_allowed(
+            &ssh_key::Algorithm::SkEd25519
+        ));
+        assert!(!is_user_key_algorithm_allowed(&ssh_key::Algorithm::Dsa));
+        assert!(!is_user_key_algorithm_allowed(&ssh_key::Algorithm::Rsa {
+            hash: None
+        }));
+    }
+
+    #[test]
+    fn builds_public_exposure_ssh_config_from_app_config() {
+        let mut config = AppConfig::defaults().unwrap();
+        config.max_auth_attempts = 7;
+        config.auth_rejection_time = std::time::Duration::from_secs(4);
+        config.keepalive_interval = std::time::Duration::from_secs(42);
+        config.keepalive_max = 5;
+        config.channel_buffer_size = 24;
+        config.event_buffer_size = 12;
+        config.window_size = 123_456;
+        config.maximum_packet_size = 16_384;
+        config.nodelay = false;
+
+        let host_key =
+            PrivateKey::random(&mut UnwrapErr(getrandom::SysRng), Algorithm::Ed25519).unwrap();
+        let state = AppState {
+            config,
+            host_key,
+            daemon_username: "uli".to_string(),
+            home_dir: PathBuf::from("/tmp"),
+            authorized_keys: AuthorizedKeysCache::empty(),
+        };
+
+        let ssh_config = build_ssh_config(&state);
+
+        assert_eq!(
+            ssh_config.methods,
+            MethodSet::from(&[MethodKind::PublicKey][..])
+        );
+        assert_eq!(
+            ssh_config.auth_rejection_time,
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(
+            ssh_config.auth_rejection_time_initial,
+            Some(std::time::Duration::from_secs(4))
+        );
+        assert_eq!(ssh_config.max_auth_attempts, 7);
+        assert_eq!(
+            ssh_config.keepalive_interval,
+            Some(std::time::Duration::from_secs(42))
+        );
+        assert_eq!(ssh_config.keepalive_max, 5);
+        assert_eq!(ssh_config.channel_buffer_size, 24);
+        assert_eq!(ssh_config.event_buffer_size, 12);
+        assert_eq!(ssh_config.window_size, 123_456);
+        assert_eq!(ssh_config.maximum_packet_size, 16_384);
+        assert!(!ssh_config.nodelay);
     }
 }
 

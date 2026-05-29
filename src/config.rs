@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use log::LevelFilter;
@@ -21,6 +22,22 @@ Subsystem sftp internal-sftp
 AllowTcpForwarding yes
 AllowRemoteForwarding yes
 GatewayPorts yes
+
+# Public exposure hardening defaults
+LoginGraceTime 15s
+ClientBannerTimeout 5s
+MaxAuthAttempts 4
+AuthRejectionTime 2s
+InactivityTimeout 15m
+KeepaliveInterval 30s
+KeepaliveMax 3
+ChannelBufferSize 32
+EventBufferSize 16
+WindowSize 1048576
+MaximumPacketSize 32768
+NoDelay yes
+AuthorizedKeysMaxSize 256KiB
+AuthorizedKeysMaxEntries 128
 
 LogLevel info
 ";
@@ -83,6 +100,20 @@ pub struct AppConfig {
     pub allow_tcp_forwarding: bool,
     pub allow_remote_forwarding: bool,
     pub gateway_ports: bool,
+    pub login_grace_time: Duration,
+    pub client_banner_timeout: Duration,
+    pub max_auth_attempts: usize,
+    pub auth_rejection_time: Duration,
+    pub inactivity_timeout: Duration,
+    pub keepalive_interval: Duration,
+    pub keepalive_max: usize,
+    pub channel_buffer_size: usize,
+    pub event_buffer_size: usize,
+    pub window_size: u32,
+    pub maximum_packet_size: u32,
+    pub nodelay: bool,
+    pub authorized_keys_max_size: usize,
+    pub authorized_keys_max_entries: usize,
     pub log_level: LogLevel,
 }
 
@@ -103,7 +134,7 @@ impl AppConfig {
         Ok(config)
     }
 
-    fn defaults() -> Result<Self> {
+    pub fn defaults() -> Result<Self> {
         let home = dirs::home_dir().context("unable to determine home directory")?;
         let config_root = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
 
@@ -119,6 +150,20 @@ impl AppConfig {
             allow_tcp_forwarding: true,
             allow_remote_forwarding: true,
             gateway_ports: true,
+            login_grace_time: Duration::from_secs(15),
+            client_banner_timeout: Duration::from_secs(5),
+            max_auth_attempts: 4,
+            auth_rejection_time: Duration::from_secs(2),
+            inactivity_timeout: Duration::from_secs(15 * 60),
+            keepalive_interval: Duration::from_secs(30),
+            keepalive_max: 3,
+            channel_buffer_size: 32,
+            event_buffer_size: 16,
+            window_size: 1_048_576,
+            maximum_packet_size: 32_768,
+            nodelay: true,
+            authorized_keys_max_size: 256 * 1024,
+            authorized_keys_max_entries: 128,
             log_level: LogLevel::Info,
         })
     }
@@ -187,6 +232,76 @@ impl AppConfig {
                     self.gateway_ports = parse_bool(values[0])
                         .with_context(|| format!("invalid GatewayPorts on line {line_number}"))?;
                 }
+                "logingracetime" => {
+                    self.login_grace_time = parse_duration(values[0])
+                        .with_context(|| format!("invalid LoginGraceTime on line {line_number}"))?;
+                }
+                "clientbannertimeout" => {
+                    self.client_banner_timeout = parse_duration(values[0]).with_context(|| {
+                        format!("invalid ClientBannerTimeout on line {line_number}")
+                    })?;
+                }
+                "maxauthattempts" => {
+                    self.max_auth_attempts = values[0].parse::<usize>().with_context(|| {
+                        format!("invalid MaxAuthAttempts on line {line_number}")
+                    })?;
+                }
+                "authrejectiontime" => {
+                    self.auth_rejection_time = parse_duration(values[0]).with_context(|| {
+                        format!("invalid AuthRejectionTime on line {line_number}")
+                    })?;
+                }
+                "inactivitytimeout" => {
+                    self.inactivity_timeout = parse_duration(values[0]).with_context(|| {
+                        format!("invalid InactivityTimeout on line {line_number}")
+                    })?;
+                }
+                "keepaliveinterval" => {
+                    self.keepalive_interval = parse_duration(values[0]).with_context(|| {
+                        format!("invalid KeepaliveInterval on line {line_number}")
+                    })?;
+                }
+                "keepalivemax" => {
+                    self.keepalive_max = values[0]
+                        .parse::<usize>()
+                        .with_context(|| format!("invalid KeepaliveMax on line {line_number}"))?;
+                }
+                "channelbuffersize" => {
+                    self.channel_buffer_size = values[0].parse::<usize>().with_context(|| {
+                        format!("invalid ChannelBufferSize on line {line_number}")
+                    })?;
+                }
+                "eventbuffersize" => {
+                    self.event_buffer_size = values[0].parse::<usize>().with_context(|| {
+                        format!("invalid EventBufferSize on line {line_number}")
+                    })?;
+                }
+                "windowsize" => {
+                    self.window_size = values[0]
+                        .parse::<u32>()
+                        .with_context(|| format!("invalid WindowSize on line {line_number}"))?;
+                }
+                "maximumpacketsize" => {
+                    self.maximum_packet_size = values[0].parse::<u32>().with_context(|| {
+                        format!("invalid MaximumPacketSize on line {line_number}")
+                    })?;
+                }
+                "nodelay" => {
+                    self.nodelay = parse_bool(values[0])
+                        .with_context(|| format!("invalid NoDelay on line {line_number}"))?;
+                }
+                "authorizedkeysmaxsize" => {
+                    self.authorized_keys_max_size =
+                        parse_byte_size(values[0]).with_context(|| {
+                            format!("invalid AuthorizedKeysMaxSize on line {line_number}")
+                        })?;
+                }
+                "authorizedkeysmaxentries" => {
+                    self.authorized_keys_max_entries =
+                        values[0].parse::<usize>().with_context(|| {
+                            format!("invalid AuthorizedKeysMaxEntries on line {line_number}")
+                        })?;
+                }
                 "pubkeyauthentication" => {
                     let enabled = parse_bool(values[0]).with_context(|| {
                         format!("invalid PubkeyAuthentication on line {line_number}")
@@ -222,6 +337,61 @@ fn parse_bool(input: &str) -> Result<bool> {
         "no" | "false" | "off" | "0" => Ok(false),
         other => bail!("expected yes/no boolean, got {other}"),
     }
+}
+
+fn parse_duration(input: &str) -> Result<Duration> {
+    let input = input.trim();
+    if input.is_empty() {
+        bail!("duration must not be empty");
+    }
+
+    let split_at = input
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(input.len());
+    let (digits, suffix) = input.split_at(split_at);
+    if digits.is_empty() {
+        bail!("duration must start with digits");
+    }
+
+    let value = digits.parse::<u64>()?;
+    let duration = match suffix.to_ascii_lowercase().as_str() {
+        "" | "s" => Duration::from_secs(value),
+        "ms" => Duration::from_millis(value),
+        "m" => Duration::from_secs(value.saturating_mul(60)),
+        "h" => Duration::from_secs(value.saturating_mul(60 * 60)),
+        other => bail!("unsupported duration suffix: {other}"),
+    };
+
+    Ok(duration)
+}
+
+fn parse_byte_size(input: &str) -> Result<usize> {
+    let input = input.trim();
+    if input.is_empty() {
+        bail!("byte size must not be empty");
+    }
+
+    let split_at = input
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(input.len());
+    let (digits, suffix) = input.split_at(split_at);
+    if digits.is_empty() {
+        bail!("byte size must start with digits");
+    }
+
+    let value = digits.parse::<usize>()?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "ki" | "kib" => 1_024,
+        "m" | "mb" => 1_000_000,
+        "mi" | "mib" => 1_048_576,
+        other => bail!("unsupported byte size suffix: {other}"),
+    };
+
+    value
+        .checked_mul(multiplier)
+        .context("byte size is too large")
 }
 
 fn default_config_path() -> Result<Option<PathBuf>> {
@@ -262,13 +432,15 @@ mod tests {
         let mut config = AppConfig::defaults().unwrap();
         config
             .apply_text(
-                "Port 9922\nListenAddress 127.0.0.1\nPasswordAuthentication no\n",
+                "Port 9922\nListenAddress 127.0.0.1\nPasswordAuthentication no\nLoginGraceTime 20s\nAuthorizedKeysMaxSize 64KiB\n",
                 Path::new("/tmp"),
             )
             .unwrap();
 
         assert_eq!(config.port, 9922);
         assert_eq!(config.listen_address, "127.0.0.1");
+        assert_eq!(config.login_grace_time, Duration::from_secs(20));
+        assert_eq!(config.authorized_keys_max_size, 64 * 1024);
     }
 
     #[test]
@@ -279,5 +451,23 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn parses_duration_suffixes() {
+        assert_eq!(
+            parse_duration("1500ms").unwrap(),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(parse_duration("15s").unwrap(), Duration::from_secs(15));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn parses_byte_sizes() {
+        assert_eq!(parse_byte_size("256").unwrap(), 256);
+        assert_eq!(parse_byte_size("64KiB").unwrap(), 64 * 1024);
+        assert_eq!(parse_byte_size("1MiB").unwrap(), 1024 * 1024);
     }
 }

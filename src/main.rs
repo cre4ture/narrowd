@@ -1,12 +1,9 @@
-mod config;
-mod sftp;
-mod sshd;
-
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use config::{AppConfig, SAMPLE_CONFIG};
+use narrowd::config::{self, AppConfig, SAMPLE_CONFIG};
+use narrowd::sshd;
 
 #[derive(Debug, Parser)]
 #[command(name = "narrowd", version, about = "Single-user Rust SSH daemon")]
