@@ -32,6 +32,22 @@ fn init_logging(level: config::LogLevel) {
     builder.init();
 }
 
+#[cfg(target_os = "linux")]
+fn enable_no_new_privs() -> Result<()> {
+    // Prevent this process and its children from gaining privileges via exec.
+    let result = unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_no_new_privs() -> Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -49,5 +65,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    enable_no_new_privs()?;
     sshd::run(config).await
 }
