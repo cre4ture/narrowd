@@ -56,16 +56,16 @@ These are intentionally conservative for a single-user daemon. If they ever beco
 
 ### 1. Connection Admission Control
 
-- [ ] Stop using `run_on_address` directly for public exposure. Own the TCP accept loop and hand accepted streams into `russh::server::run_stream` only after admission checks.
-- [ ] Track unauthenticated connections globally.
-- [ ] Track unauthenticated connections per source IP.
-- [ ] Track unauthenticated connections per source subnet.
-- [ ] Reject new connections once the global unauthenticated cap is reached.
-- [ ] Reject new connections once the per-IP cap is reached.
-- [ ] Reject new connections once the per-subnet cap is reached.
-- [ ] Add a token-bucket rate limiter for new TCP connections per IP.
-- [ ] Add short temporary bans after repeated authentication failures from the same IP.
-- [ ] Expire stale counters automatically so the daemon does not grow unbounded IP state.
+- [x] Stop using `run_on_address` directly for public exposure. Own the TCP accept loop and hand accepted streams into `russh::server::run_stream` only after admission checks.
+- [x] Track unauthenticated connections globally.
+- [x] Track unauthenticated connections per source IP.
+- [x] Track unauthenticated connections per source subnet.
+- [x] Reject new connections once the global unauthenticated cap is reached.
+- [x] Reject new connections once the per-IP cap is reached.
+- [x] Reject new connections once the per-subnet cap is reached.
+- [x] Add a token-bucket rate limiter for new TCP connections per IP.
+- [x] Add short temporary bans after repeated authentication failures from the same IP.
+- [x] Expire stale counters automatically so the daemon does not grow unbounded IP state.
 
 Suggested implementation notes:
 
@@ -82,11 +82,11 @@ Attack styles mitigated:
 
 ### 2. Hard Pre-Auth Timeouts
 
-- [ ] Add an absolute `LoginGraceTime` equivalent of `15s` from TCP accept to successful authentication.
-- [ ] Add a `5s` timeout to receive the client SSH identification string.
+- [x] Add an absolute `LoginGraceTime` equivalent of `15s` from TCP accept to successful authentication.
+- [x] Add a `5s` timeout to receive the client SSH identification string.
 - [ ] Add a `5s` timeout from banner exchange to key-exchange start.
-- [ ] Keep the timeout absolute. Do not let the client extend it indefinitely by trickling bytes.
-- [ ] Close pre-auth connections that stall during banner, KEX, or authentication.
+- [x] Keep the timeout absolute. Do not let the client extend it indefinitely by trickling bytes.
+- [x] Close pre-auth connections that stall during banner, KEX, or authentication.
 
 Suggested implementation notes:
 
@@ -102,10 +102,10 @@ Attack styles mitigated:
 
 ### 3. Uniform Authentication Cost
 
-- [ ] Use a non-zero rejection delay for the initial auth-method probe.
-- [ ] Keep rejection delay uniform for unknown usernames, unknown keys, and wrong signatures.
-- [ ] Set `max_auth_attempts = 4`.
-- [ ] Do not do materially more work for malformed or unknown keys than for ordinary failures.
+- [x] Use a non-zero rejection delay for the initial auth-method probe.
+- [x] Keep rejection delay uniform for unknown usernames, unknown keys, and wrong signatures.
+- [x] Set `max_auth_attempts = 4`.
+- [x] Do not do materially more work for malformed or unknown keys than for ordinary failures.
 
 Suggested implementation notes:
 
@@ -120,12 +120,12 @@ Attack styles mitigated:
 
 ### 4. In-Memory Authorized Keys Cache
 
-- [ ] Parse `authorized_keys` once and keep the accepted keys in memory.
-- [ ] Store a direct lookup structure keyed by public key bytes or fingerprint.
-- [ ] Enforce `authorized_keys_max_size = 256 KiB`.
-- [ ] Enforce `authorized_keys_max_entries = 128`.
-- [ ] Reject duplicate entries during cache build.
-- [ ] Keep the existing fail-closed behavior for entries with OpenSSH key options.
+- [x] Parse `authorized_keys` once and keep the accepted keys in memory.
+- [x] Store a direct lookup structure keyed by public key bytes or fingerprint.
+- [x] Enforce `authorized_keys_max_size = 256 KiB`.
+- [x] Enforce `authorized_keys_max_entries = 128`.
+- [x] Reject duplicate entries during cache build.
+- [x] Keep the existing fail-closed behavior for entries with OpenSSH key options.
 - [ ] Reload on explicit signal, or on file mtime change with debounce.
 - [ ] If reload fails, keep the last known-good cache instead of replacing it with a broken one.
 
@@ -142,11 +142,11 @@ Attack styles mitigated:
 
 ### 5. Narrow Crypto and Auth Surface
 
-- [ ] Explicitly set the `russh` server auth method set to only the methods `narrowd` wants to support.
-- [ ] Explicitly configure the preferred KEX, cipher, MAC, and host-key algorithms instead of relying on defaults.
-- [ ] Accept only modern user key algorithms by default.
-- [ ] Keep Ed25519 as the default host key type.
-- [ ] Drop legacy key types from the default public-exposure profile.
+- [x] Explicitly set the `russh` server auth method set to only the methods `narrowd` wants to support.
+- [x] Explicitly configure the preferred KEX, cipher, MAC, and host-key algorithms instead of relying on defaults.
+- [x] Accept only modern user key algorithms by default.
+- [x] Keep Ed25519 as the default host key type.
+- [x] Drop legacy key types from the default public-exposure profile.
 
 Recommended default allowlists:
 
@@ -161,14 +161,14 @@ Attack styles mitigated:
 
 ### 6. Bounded Buffers and Runtime Resources
 
-- [ ] Set `channel_buffer_size = 32`.
-- [ ] Set `event_buffer_size = 16`.
-- [ ] Set `window_size = 1048576`.
-- [ ] Keep `maximum_packet_size = 32768` unless a smaller tested value is chosen.
-- [ ] Set `inactivity_timeout = 15m`.
-- [ ] Set `keepalive_interval = 30s`.
-- [ ] Set `keepalive_max = 3`.
-- [ ] Set `nodelay = true` for interactive behavior, but do not treat it as a security control.
+- [x] Set `channel_buffer_size = 32`.
+- [x] Set `event_buffer_size = 16`.
+- [x] Set `window_size = 1048576`.
+- [x] Keep `maximum_packet_size = 32768` unless a smaller tested value is chosen.
+- [x] Set `inactivity_timeout = 15m`.
+- [x] Set `keepalive_interval = 30s`.
+- [x] Set `keepalive_max = 3`.
+- [x] Set `nodelay = true` for interactive behavior, but do not treat it as a security control.
 
 Suggested implementation notes:
 
@@ -183,8 +183,8 @@ Attack styles mitigated:
 
 ### 7. Log and Metrics Hardening
 
-- [ ] Rate-limit warning logs per IP and per reason.
-- [ ] Aggregate repeated failures into summary events instead of emitting one warning per packet or per failed attempt.
+- [x] Rate-limit warning logs per IP and per reason.
+- [x] Aggregate repeated failures into summary events instead of emitting one warning per packet or per failed attempt.
 - [ ] Record counters for current unauthenticated connections.
 - [ ] Record counters for rejected connections by reason.
 - [ ] Record counters for auth failures by IP.
@@ -229,9 +229,9 @@ Attack styles mitigated:
 
 ### 9. Panic and Crash Isolation
 
-- [ ] Make sure one bad connection cannot crash the whole daemon.
-- [ ] Isolate per-connection failures so malformed input results in connection teardown, not process exit.
-- [ ] Add a small outer supervisor that logs connection-level crashes and keeps the main listener alive.
+- [x] Make sure one bad connection cannot crash the whole daemon.
+- [x] Isolate per-connection failures so malformed input results in connection teardown, not process exit.
+- [x] Add a small outer supervisor that logs connection-level crashes and keeps the main listener alive.
 - [ ] Prefer dropping the offending connection over attempting complicated recovery inside corrupted connection state.
 
 Attack styles mitigated:
@@ -269,23 +269,23 @@ These are explicitly out of scope for this roadmap:
 
 ## Suggested Implementation Order
 
-- [ ] Phase 1: connection admission control
-- [ ] Phase 2: hard pre-auth timeouts
-- [ ] Phase 3: in-memory `authorized_keys` cache
-- [ ] Phase 4: narrow crypto and auth surface
-- [ ] Phase 5: bounded buffers and log hardening
+- [x] Phase 1: connection admission control
+- [x] Phase 2: hard pre-auth timeouts
+- [x] Phase 3: in-memory `authorized_keys` cache
+- [x] Phase 4: narrow crypto and auth surface
+- [x] Phase 5: bounded buffers and log hardening
 - [ ] Phase 6: pre-auth exploit containment split
 - [ ] Phase 7: panic isolation and attack-focused integration tests
 
 ## Testing Expectations For The Hardened Design
 
-- [ ] integration test for global unauthenticated connection cap
+- [x] integration test for global unauthenticated connection cap
 - [ ] integration test for per-IP unauthenticated cap
-- [ ] integration test for per-IP rate limiting and ban expiry
-- [ ] integration test for slow banner timeout
+- [x] integration test for per-IP rate limiting and ban expiry
+- [x] integration test for slow banner timeout
 - [ ] integration test for slow KEX timeout
-- [ ] integration test for absolute login grace timeout
+- [x] integration test for absolute login grace timeout
 - [ ] integration test that auth attempts do not touch disk after cache warm-up
 - [ ] integration test for cache reload success and failed-reload fallback
 - [ ] integration test for malformed auth spam not producing unbounded logs
-- [ ] integration test that a crashing connection does not kill the listener
+- [x] integration test that a crashing connection does not kill the listener
