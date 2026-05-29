@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::Arc;
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::Duration;
@@ -9,6 +10,7 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 use narrowd::config::AppConfig;
 use narrowd::sshd;
 use nix::unistd::{User, getuid};
+use russh::ChannelMsg;
 use russh::client;
 use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, ssh_key};
 use tempfile::TempDir;
@@ -168,6 +170,56 @@ async fn authenticated_sessions_release_unauth_slots() -> Result<()> {
 }
 
 #[tokio::test]
+async fn exec_requests_run_through_executor_process() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let client_key = Arc::new(generate_ed25519_key()?);
+    let authorized_keys = format!("{}\n", client_key.public_key().to_openssh()?);
+    let config = test_config(&tempdir, &authorized_keys, |config| {
+        config.client_banner_timeout = Duration::from_millis(500);
+        config.login_grace_time = Duration::from_secs(1);
+    })?;
+    let (addr, task) = spawn_server(config).await?;
+
+    let result = exec_with_key(addr, Arc::clone(&client_key), "printf 'executor-ok\\n'").await?;
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(result.stdout, "executor-ok\n");
+    assert!(result.stderr.is_empty());
+
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn main_binary_sets_no_new_privs_only_on_the_preauth_process() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let client_key = Arc::new(generate_ed25519_key()?);
+    let authorized_keys = format!("{}\n", client_key.public_key().to_openssh()?);
+    let port = unused_local_port()?;
+    let (host_key, authorized_keys_path) = write_binary_server_keys(&tempdir, &authorized_keys)?;
+    let config_path = write_binary_server_config(&tempdir, port, &host_key, &authorized_keys_path)?;
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut server = SpawnedBinaryServer::start(&config_path, addr)?;
+
+    wait_for_binary_server(addr).await?;
+
+    let server_status = std::fs::read_to_string(format!("/proc/{}/status", server.pid()))
+        .context("failed to read server /proc status")?;
+    assert_eq!(parse_no_new_privs(&server_status), Some(1));
+
+    let result = exec_with_key(
+        addr,
+        Arc::clone(&client_key),
+        "grep '^NoNewPrivs:' /proc/self/status",
+    )
+    .await?;
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(parse_no_new_privs(&result.stdout), Some(0));
+
+    server.stop()?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn rejects_connections_over_global_unauth_limit_before_banner() -> Result<()> {
     let tempdir = TempDir::new()?;
     let config = test_config(&tempdir, "", |config| {
@@ -300,7 +352,10 @@ async fn repeated_auth_rejects_are_log_limited() -> Result<()> {
         })
         .count();
 
-    assert_eq!(matching_logs, 1, "expected only the first repeated auth warning to be logged");
+    assert_eq!(
+        matching_logs, 1,
+        "expected only the first repeated auth warning to be logged"
+    );
 
     task.abort();
     Ok(())
@@ -487,6 +542,49 @@ async fn authenticate_with_key(addr: SocketAddr, key: Arc<PrivateKey>) -> Result
     Ok(auth.success())
 }
 
+async fn exec_with_key(
+    addr: SocketAddr,
+    key: Arc<PrivateKey>,
+    command: &str,
+) -> Result<ExecResult> {
+    let mut session = connect_client(addr).await.map_err(anyhow::Error::from)?;
+    let auth = session
+        .authenticate_publickey(&daemon_username()?, PrivateKeyWithHashAlg::new(key, None))
+        .await
+        .map_err(anyhow::Error::from)?;
+    if !auth.success() {
+        anyhow::bail!("public-key authentication failed");
+    }
+
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(anyhow::Error::from)?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_status = None;
+
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+            _ => {}
+        }
+    }
+
+    Ok(ExecResult {
+        stdout: String::from_utf8(stdout).context("stdout was not valid UTF-8")?,
+        stderr: String::from_utf8(stderr).context("stderr was not valid UTF-8")?,
+        exit_status: exit_status.context("exec request did not report an exit status")?,
+    })
+}
+
 fn install_test_logger() {
     let entries = LOG_ENTRIES.get_or_init(|| Mutex::new(Vec::new()));
     LOGGER_INIT.call_once(|| {
@@ -522,6 +620,89 @@ fn daemon_username() -> Result<String> {
         .context("failed to resolve daemon user")?
         .context("current uid has no passwd entry")?;
     Ok(user.name)
+}
+
+fn unused_local_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .context("failed to bind a temporary local port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn write_binary_server_keys(
+    tempdir: &TempDir,
+    authorized_keys: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let host_key = tempdir.path().join("ssh_host_ed25519_key");
+    let authorized_keys_path = tempdir.path().join("authorized_keys");
+
+    generate_ed25519_key()?
+        .write_openssh_file(&host_key, ssh_key::LineEnding::LF)
+        .with_context(|| format!("failed to write host key {}", host_key.display()))?;
+    std::fs::write(&authorized_keys_path, authorized_keys).with_context(|| {
+        format!(
+            "failed to write authorized_keys file {}",
+            authorized_keys_path.display()
+        )
+    })?;
+
+    Ok((host_key, authorized_keys_path))
+}
+
+fn write_binary_server_config(
+    tempdir: &TempDir,
+    port: u16,
+    host_key: &std::path::Path,
+    authorized_keys_path: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let config_path = tempdir.path().join("narrowd.conf");
+    let config = format!(
+        "\
+Port {port}
+ListenAddress 127.0.0.1
+HostKey {}
+AuthorizedKeysFile {}
+Shell /bin/bash
+PermitTTY yes
+PermitExec yes
+SftpEnabled yes
+AllowTcpForwarding yes
+AllowRemoteForwarding yes
+GatewayPorts yes
+LogLevel debug
+",
+        host_key.display(),
+        authorized_keys_path.display(),
+    );
+    std::fs::write(&config_path, config)
+        .with_context(|| format!("failed to write config {}", config_path.display()))?;
+    Ok(config_path)
+}
+
+async fn wait_for_binary_server(addr: SocketAddr) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!("binary server did not become ready within 5s");
+        }
+
+        match TcpStream::connect(addr).await {
+            Ok(mut stream) => {
+                let banner = read_banner(&mut stream).await?;
+                if banner.starts_with(b"SSH-2.0-") {
+                    return Ok(());
+                }
+            }
+            Err(_) => {}
+        }
+
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn parse_no_new_privs(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("NoNewPrivs:"))
+        .and_then(|value| value.trim().parse().ok())
 }
 
 async fn read_banner(stream: &mut TcpStream) -> Result<Vec<u8>> {
@@ -607,5 +788,48 @@ async fn expect_close_without_banner(stream: &mut TcpStream, within: Duration) -
         }
         Ok(Err(err)) => Err(err).context("unexpected read error"),
         Err(_) => anyhow::bail!("connection stayed open for {:?}", within),
+    }
+}
+
+struct ExecResult {
+    stdout: String,
+    stderr: String,
+    exit_status: u32,
+}
+
+struct SpawnedBinaryServer {
+    child: Child,
+}
+
+impl SpawnedBinaryServer {
+    fn start(config_path: &std::path::Path, addr: SocketAddr) -> Result<Self> {
+        let child = StdCommand::new(env!("CARGO_BIN_EXE_narrowd"))
+            .arg("--config")
+            .arg(config_path)
+            .env_remove("RUST_LOG")
+            .env("NARROWD_EXECUTOR_PROGRAM", env!("CARGO_BIN_EXE_narrowd"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| {
+                format!("failed to start the narrowd binary for integration testing on {addr}")
+            })?;
+        Ok(Self { child })
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Ok(())
+    }
+}
+
+impl Drop for SpawnedBinaryServer {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }

@@ -1,5 +1,6 @@
 mod admission;
 mod authorized_keys;
+pub mod executor;
 mod log_limiter;
 mod metrics;
 

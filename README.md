@@ -31,6 +31,8 @@ Security model / exposure guidance:
 - The public exposure profile only accepts modern Ed25519-family SSH keys for both the host key and user authentication keys.
 - The public exposure profile also keeps a narrow SSH transport surface: modern KEX only, modern ciphers/MACs only, and no SSH compression.
 - Pre-auth resource controls are built in for public exposure: global/per-IP/per-subnet unauthenticated connection caps, per-IP new-connection rate limiting, temporary bans after repeated auth failures, a short client-banner timeout, and an absolute login grace deadline that also covers KEX stalls.
+- Post-auth OS work runs in a separate executor process. The network-facing SSH parser process no longer directly spawns shells, opens PTYs, touches SFTP state, or binds/connects forwarding sockets itself.
+- In the main `narrowd` binary, `no_new_privs` is applied only after the executor process has been spawned. That keeps the pre-auth parser constrained while still allowing post-auth shells to use normal local privilege-escalation tools such as `sudo` if the underlying system would otherwise permit them.
 - The `authorized_keys` cache is kept in memory and reloaded automatically on file changes with a small debounce. If a reload fails, `narrowd` keeps serving from the last known-good in-memory cache and logs the failure.
 - SFTP is not chrooted or confined to a separate subtree. It follows the filesystem permissions of the daemon process user. If that same user is intentionally allowed shell access, this does not expand privileges beyond that account.
 - `authorized_keys` is used for key matching, but `narrowd` only accepts plain key lines. Entries that include OpenSSH key options such as `command=`, `from=`, or no-forwarding flags are completely rejected instead of being interpreted as unrestricted keys.
@@ -89,9 +91,10 @@ systemctl --user enable --now narrowd.service
 The generated package is intentionally set up for a `systemd --user` service,
 not a root-owned system daemon. The packaged launcher refuses to start as
 `root`, so the SSH session, SFTP access, and port forwarding all run with the
-permissions of the target login account. The packaged user service also enables
-`NoNewPrivileges=yes` and restricts address families to `AF_UNIX`, `AF_INET`,
-and `AF_INET6`.
+permissions of the target login account. The packaged user service restricts
+address families to `AF_UNIX`, `AF_INET`, and `AF_INET6`. `no_new_privs` is
+applied by the main `narrowd` process itself after it has started the separate
+post-auth executor process.
 
 RDP over SSH tunnel:
 

@@ -1,33 +1,27 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Error as IoError, ErrorKind, Read, Write};
+use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc as std_mpsc};
 use std::task::{Context as TaskContext, Poll};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::FutureExt;
 use getrandom::rand_core::UnwrapErr;
 use log::{debug, error, info, warn};
-use nix::sys::signal::{Signal, kill, killpg};
-use nix::unistd::{Pid, User, getuid};
-use portable_pty::{
-    Child as PtyChild, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system,
-};
+use nix::unistd::{User, getuid};
+use portable_pty::PtySize;
 use russh::keys::{Algorithm, PrivateKey, ssh_key};
 use russh::server::{self, Auth, Msg, Session};
-use russh::{Channel, ChannelId, ChannelMsg, MethodKind, MethodSet, Sig};
+use russh::{Channel, ChannelId, ChannelMsg, MethodKind, MethodSet};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{ChildStdin, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::time::{Instant as TokioInstant, Sleep, timeout};
 
 use crate::admission::{AdmissionConfig, AdmissionController, AdmissionGuard};
@@ -35,12 +29,16 @@ use crate::authorized_keys::{
     AuthorizedKeysReloadEvent, AuthorizedKeysReloadStatus, AuthorizedKeysStore,
 };
 use crate::config::AppConfig;
+use crate::executor::{
+    self, ExecutorClient, ProcessInput, ProcessOutput, ProcessRequest, SerializablePtyRequest,
+    SerializablePtySize,
+};
 use crate::log_limiter::{LogDecision, LogKey, LogLimiter};
 use crate::metrics::ServerMetrics;
-use crate::sftp::LocalSftp;
 
 pub async fn run(config: AppConfig) -> Result<()> {
     let state = Arc::new(AppState::bootstrap(config)?);
+    enable_no_new_privs()?;
 
     info!(
         "starting narrowd on {}:{} with host key {}",
@@ -98,6 +96,7 @@ struct AppState {
     host_key: PrivateKey,
     daemon_username: String,
     home_dir: PathBuf,
+    executor: ExecutorClient,
     authorized_keys: AuthorizedKeysStore,
     admission: AdmissionController,
     log_limiter: LogLimiter,
@@ -161,6 +160,8 @@ impl AppState {
             );
         }
 
+        let executor = ExecutorClient::spawn(config.shell.clone(), home_dir.clone())?;
+
         Ok(Self {
             admission: AdmissionController::new(AdmissionConfig::from_app_config(&config)),
             log_limiter: LogLimiter::new(Duration::from_secs(30), 4096),
@@ -169,6 +170,7 @@ impl AppState {
             host_key,
             daemon_username,
             home_dir,
+            executor,
             authorized_keys,
         })
     }
@@ -632,6 +634,10 @@ struct ForwardKey {
     port: u32,
 }
 
+struct RemoteForwardHandle {
+    token: u64,
+}
+
 struct PendingChannel {
     channel: Channel<Msg>,
     pty: Option<PtyRequest>,
@@ -649,7 +655,7 @@ struct ClientHandler {
     peer: Option<SocketAddr>,
     preauth: PreauthContext,
     pending_channels: HashMap<ChannelId, PendingChannel>,
-    remote_forwards: HashMap<ForwardKey, tokio::task::JoinHandle<()>>,
+    remote_forwards: HashMap<ForwardKey, RemoteForwardHandle>,
     requested_user: Option<String>,
 }
 
@@ -748,8 +754,14 @@ impl ClientHandler {
 
 impl Drop for ClientHandler {
     fn drop(&mut self) {
-        for (_, task) in self.remote_forwards.drain() {
-            task.abort();
+        let executor = self.state.executor.clone();
+        for (_, remote_forward) in self.remote_forwards.drain() {
+            let executor = executor.clone();
+            tokio::spawn(async move {
+                if let Err(err) = executor.cancel_remote_forward(remote_forward.token).await {
+                    debug!("failed to cancel remote forward during session drop: {err:#}");
+                }
+            });
         }
     }
 }
@@ -832,7 +844,12 @@ impl server::Handler for ClientHandler {
             return Ok(false);
         };
 
-        match TcpStream::connect((host_to_connect, port)).await {
+        match self
+            .state
+            .executor
+            .connect_tcp(host_to_connect.to_string(), port)
+            .await
+        {
             Ok(stream) => {
                 info!(
                     "direct-tcpip {}:{} from {}:{} on channel {:?}",
@@ -844,14 +861,14 @@ impl server::Handler for ClientHandler {
                 );
                 tokio::spawn(async move {
                     if let Err(err) = proxy_stream(channel.into_stream(), stream).await {
-                        debug!("direct-tcpip proxy ended: {err}");
+                        debug!("direct-tcpip proxy ended: {err:#}");
                     }
                 });
                 Ok(true)
             }
             Err(err) => {
                 warn!(
-                    "direct-tcpip connect {}:{} failed: {err}",
+                    "direct-tcpip connect {}:{} failed: {err:#}",
                     host_to_connect, port_to_connect
                 );
                 Ok(false)
@@ -963,9 +980,15 @@ impl server::Handler for ClientHandler {
         }
 
         let pending = self.take_channel(channel)?;
-        let sftp = LocalSftp::new(self.state.home_dir.clone());
-        session.channel_success(channel)?;
-        russh_sftp::server::run(pending.channel.into_stream(), sftp).await;
+        match launch_sftp(Arc::clone(&self.state), pending).await {
+            Ok(()) => {
+                session.channel_success(channel)?;
+            }
+            Err(err) => {
+                error!("failed to start sftp on channel {channel:?}: {err:#}");
+                session.channel_failure(channel)?;
+            }
+        }
         Ok(())
     }
 
@@ -1000,27 +1023,14 @@ impl server::Handler for ClientHandler {
         };
 
         let requested_port = u16::try_from(*port).context("invalid tcpip-forward port")?;
-        let bind_addr = tokio::net::lookup_host((bind_host, requested_port))
-            .await
-            .context("failed to resolve tcpip-forward bind address")?
-            .next()
-            .ok_or_else(|| anyhow!("no bind address for tcpip-forward request"))?;
-
-        let listener = match TcpListener::bind(bind_addr).await {
-            Ok(listener) => listener,
-            Err(err) => {
-                warn!("failed to bind remote forward {bind_host}:{requested_port}: {err}");
-                return Ok(false);
-            }
+        let connected_address = if address.is_empty() {
+            bind_host.to_string()
+        } else {
+            address.to_string()
         };
-
-        let local_addr = listener
-            .local_addr()
-            .context("failed to inspect listener address")?;
-        *port = u32::from(local_addr.port());
         let key = ForwardKey {
             address: address.to_string(),
-            port: *port,
+            port: u32::from(requested_port),
         };
 
         if self.remote_forwards.contains_key(&key) {
@@ -1031,52 +1041,42 @@ impl server::Handler for ClientHandler {
             return Ok(false);
         }
 
-        let handle = session.handle();
-        let connected_address = if address.is_empty() {
-            bind_host.to_string()
-        } else {
-            address.to_string()
-        };
-        let connected_port = *port;
-
-        info!(
-            "accepted remote forward {}:{} (bound as {})",
-            connected_address, connected_port, local_addr
-        );
-
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((stream, origin)) = listener.accept().await else {
-                    break;
-                };
-
-                let handle = handle.clone();
-                let connected_address = connected_address.clone();
-                tokio::spawn(async move {
-                    match handle
-                        .channel_open_forwarded_tcpip(
-                            connected_address,
-                            connected_port,
-                            origin.ip().to_string(),
-                            u32::from(origin.port()),
-                        )
-                        .await
-                    {
-                        Ok(channel) => {
-                            if let Err(err) = proxy_stream(channel.into_stream(), stream).await {
-                                debug!("forwarded-tcpip proxy ended: {err}");
-                            }
-                        }
-                        Err(err) => {
-                            debug!("failed to open forwarded-tcpip channel: {err}");
-                        }
-                    }
-                });
+        match self
+            .state
+            .executor
+            .start_remote_forward(
+                session.handle(),
+                connected_address.clone(),
+                bind_host.to_string(),
+                requested_port,
+            )
+            .await
+        {
+            Ok(remote_forward) => {
+                *port = remote_forward.bound_port;
+                info!(
+                    "accepted remote forward {}:{} (bound by executor on {}:{})",
+                    connected_address, *port, bind_host, remote_forward.bound_port
+                );
+                self.remote_forwards.insert(
+                    ForwardKey {
+                        address: address.to_string(),
+                        port: *port,
+                    },
+                    RemoteForwardHandle {
+                        token: remote_forward.token,
+                    },
+                );
+                Ok(true)
             }
-        });
-
-        self.remote_forwards.insert(key, task);
-        Ok(true)
+            Err(err) => {
+                warn!(
+                    "failed to bind remote forward {}:{}: {err:#}",
+                    bind_host, requested_port
+                );
+                Ok(false)
+            }
+        }
     }
 
     async fn cancel_tcpip_forward(
@@ -1090,8 +1090,11 @@ impl server::Handler for ClientHandler {
             port,
         };
 
-        if let Some(task) = self.remote_forwards.remove(&key) {
-            task.abort();
+        if let Some(remote_forward) = self.remote_forwards.remove(&key) {
+            self.state
+                .executor
+                .cancel_remote_forward(remote_forward.token)
+                .await?;
             info!("cancelled remote forward {}:{}", address, port);
             Ok(true)
         } else {
@@ -1101,425 +1104,173 @@ impl server::Handler for ClientHandler {
 }
 
 async fn launch_shell(state: Arc<AppState>, pending: PendingChannel) -> Result<()> {
-    if pending.pty.is_some() {
-        launch_pty_process(state, pending, None).await
-    } else {
-        launch_piped_process(state, pending, None).await
-    }
+    launch_process(state, pending, None).await
 }
 
 async fn launch_exec(state: Arc<AppState>, pending: PendingChannel, command: String) -> Result<()> {
-    if pending.pty.is_some() {
-        launch_pty_process(state, pending, Some(command)).await
-    } else {
-        launch_piped_process(state, pending, Some(command)).await
-    }
+    launch_process(state, pending, Some(command)).await
 }
 
-struct PtyLaunch {
-    master: Box<dyn MasterPty + Send>,
-    reader: Box<dyn Read + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn PtyChild + Send + Sync>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
-    process_group: Option<i32>,
+async fn launch_sftp(state: Arc<AppState>, pending: PendingChannel) -> Result<()> {
+    let stream = state.executor.start_sftp().await?;
+    tokio::spawn(async move {
+        if let Err(err) = proxy_stream(pending.channel.into_stream(), stream).await {
+            debug!("sftp proxy ended: {err:#}");
+        }
+    });
+    Ok(())
 }
 
-enum PtyControl {
-    Write(Vec<u8>),
-    Resize(PtySize),
-    Signal(Sig),
-    Eof,
-    Close,
-}
-
-async fn launch_pty_process(
+async fn launch_process(
     state: Arc<AppState>,
     pending: PendingChannel,
     command: Option<String>,
 ) -> Result<()> {
-    let pty = pending.pty.clone().unwrap_or(PtyRequest {
-        term: "xterm-256color".to_string(),
-        size: PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        },
-    });
-
-    let env = build_child_env(&state, &pending.env, Some(&pty.term));
-    let shell = state.config.shell.clone();
-    let cwd = state.home_dir.clone();
-
-    let mut launch = tokio::task::spawn_blocking(move || -> Result<PtyLaunch> {
-        let pty_system = native_pty_system();
-        let pair = pty_system.openpty(pty.size).context("failed to open PTY")?;
-
-        let mut builder = CommandBuilder::new(&shell);
-        builder.cwd(&cwd);
-        for (key, value) in env {
-            builder.env(key, value);
-        }
-        if let Some(command) = command {
-            builder.arg("-lc");
-            builder.arg(command);
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(builder)
-            .context("failed to spawn PTY child")?;
-        let killer = child.clone_killer();
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .context("failed to clone PTY reader")?;
-        let writer = pair
-            .master
-            .take_writer()
-            .context("failed to take PTY writer")?;
-        let process_group = pair.master.process_group_leader();
-
-        Ok(PtyLaunch {
-            master: pair.master,
-            reader,
-            writer,
-            child,
-            killer,
-            process_group,
-        })
-    })
-    .await
-    .context("PTY spawn task failed")??;
-
-    let (mut chan_read, chan_write) = pending.channel.split();
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (exit_tx, mut exit_rx) = oneshot::channel::<u32>();
-    let (control_tx, control_rx) = std_mpsc::channel::<PtyControl>();
-
-    thread::spawn(move || run_pty_reader(launch.reader, output_tx));
-    thread::spawn(move || {
-        run_pty_control(
-            control_rx,
-            launch.master,
-            launch.writer,
-            launch.killer,
-            launch.process_group,
-        )
-    });
-    thread::spawn(move || {
-        let code = launch
-            .child
-            .wait()
-            .map(|status| status.exit_code())
-            .unwrap_or(255);
-        let _ = exit_tx.send(code);
-    });
-
+    let request = ProcessRequest {
+        pty: pending.pty.as_ref().map(to_executor_pty_request),
+        env: build_child_env(
+            &state,
+            &pending.env,
+            pending.pty.as_ref().map(|pty| pty.term.as_str()),
+        ),
+        command,
+    };
+    let stream = state.executor.start_process(request).await?;
     tokio::spawn(async move {
-        let input_task = tokio::spawn(async move {
-            while let Some(message) = chan_read.wait().await {
-                match message {
-                    ChannelMsg::Data { data } => {
-                        if control_tx.send(PtyControl::Write(data.to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                    ChannelMsg::Signal { signal } => {
-                        let _ = control_tx.send(PtyControl::Signal(signal));
-                    }
-                    ChannelMsg::WindowChange {
-                        col_width,
-                        row_height,
-                        pix_width,
-                        pix_height,
-                    } => {
-                        let _ = control_tx.send(PtyControl::Resize(PtySize {
-                            rows: clamp_dimension(row_height),
-                            cols: clamp_dimension(col_width),
-                            pixel_width: clamp_dimension(pix_width),
-                            pixel_height: clamp_dimension(pix_height),
-                        }));
-                    }
-                    ChannelMsg::Eof => {
-                        let _ = control_tx.send(PtyControl::Eof);
-                    }
-                    ChannelMsg::Close => {
-                        let _ = control_tx.send(PtyControl::Close);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            let _ = control_tx.send(PtyControl::Close);
-        });
-
-        let mut child_exit = None;
-        let mut output_closed = false;
-
-        loop {
-            if output_closed && child_exit.is_some() {
-                break;
-            }
-
-            tokio::select! {
-                maybe_chunk = output_rx.recv(), if !output_closed => {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            if chan_write.data_bytes(chunk).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => output_closed = true,
-                    }
-                }
-                result = &mut exit_rx, if child_exit.is_none() => {
-                    child_exit = Some(result.unwrap_or(255));
-                }
-            }
+        if let Err(err) = bridge_process_channel(pending.channel, stream).await {
+            debug!("process channel bridge ended: {err:#}");
         }
-
-        if let Some(code) = child_exit {
-            let _ = chan_write.exit_status(code).await;
-        }
-        let _ = chan_write.eof().await;
-        let _ = chan_write.close().await;
-        let _ = input_task.await;
     });
-
     Ok(())
 }
 
-async fn launch_piped_process(
-    state: Arc<AppState>,
-    pending: PendingChannel,
-    command: Option<String>,
+async fn bridge_process_channel(
+    channel: Channel<Msg>,
+    stream: tokio::net::UnixStream,
 ) -> Result<()> {
-    let mut process = Command::new(&state.config.shell);
-    process.current_dir(&state.home_dir);
-    process.stdin(Stdio::piped());
-    process.stdout(Stdio::piped());
-    process.stderr(Stdio::piped());
-    process.kill_on_drop(true);
+    let (mut chan_read, chan_write) = channel.split();
+    let (mut stream_read, mut stream_write) = tokio::io::split(stream);
+    let input_task =
+        tokio::spawn(async move { handle_process_input(&mut chan_read, &mut stream_write).await });
+    let mut exit_status = None;
 
-    for (key, value) in build_child_env(&state, &pending.env, None) {
-        process.env(key, value);
-    }
-
-    if let Some(command) = command {
-        process.arg("-lc");
-        process.arg(command);
-    }
-
-    let mut child = process.spawn().context("failed to spawn child process")?;
-    let pid = child.id().context("child process has no pid")?;
-    let stdin = child.stdin.take().context("missing child stdin")?;
-    let stdout = child.stdout.take().context("missing child stdout")?;
-    let stderr = child.stderr.take().context("missing child stderr")?;
-    let (mut chan_read, chan_write) = pending.channel.split();
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<ProcessOutput>();
-    let (exit_tx, mut exit_rx) = oneshot::channel::<u32>();
-
-    tokio::spawn(read_process_stream(
-        stdout,
-        ProcessStream::Stdout,
-        output_tx.clone(),
-    ));
-    tokio::spawn(read_process_stream(
-        stderr,
-        ProcessStream::Stderr,
-        output_tx,
-    ));
-    tokio::spawn(async move {
-        let code = child.wait().await.map(exit_status_code).unwrap_or(255);
-        let _ = exit_tx.send(code);
-    });
-
-    tokio::spawn(async move {
-        let input_task = tokio::spawn(async move {
-            handle_piped_input(pid, &mut chan_read, stdin).await;
-        });
-
-        let mut child_exit = None;
-        let mut output_closed = false;
-
-        loop {
-            if output_closed && child_exit.is_some() {
-                break;
-            }
-
-            tokio::select! {
-                maybe_output = output_rx.recv(), if !output_closed => {
-                    match maybe_output {
-                        Some(ProcessOutput::Stdout(data)) => {
-                            if chan_write.data_bytes(data).await.is_err() {
-                                let _ = send_signal_to_pid(pid, Signal::SIGKILL);
-                                break;
-                            }
-                        }
-                        Some(ProcessOutput::Stderr(data)) => {
-                            if chan_write.extended_data_bytes(1, data).await.is_err() {
-                                let _ = send_signal_to_pid(pid, Signal::SIGKILL);
-                                break;
-                            }
-                        }
-                        None => output_closed = true,
-                    }
-                }
-                result = &mut exit_rx, if child_exit.is_none() => {
-                    child_exit = Some(result.unwrap_or(255));
-                }
-            }
-        }
-
-        if let Some(code) = child_exit {
-            let _ = chan_write.exit_status(code).await;
-        }
-        let _ = chan_write.eof().await;
-        let _ = chan_write.close().await;
-        let _ = input_task.await;
-    });
-
-    Ok(())
-}
-
-enum ProcessStream {
-    Stdout,
-    Stderr,
-}
-
-enum ProcessOutput {
-    Stdout(Vec<u8>),
-    Stderr(Vec<u8>),
-}
-
-async fn handle_piped_input(
-    pid: u32,
-    chan_read: &mut russh::ChannelReadHalf,
-    mut stdin: ChildStdin,
-) {
-    while let Some(message) = chan_read.wait().await {
+    while let Some(message) = read_process_message(&mut stream_read).await? {
         match message {
-            ChannelMsg::Data { data } => {
-                if stdin.write_all(&data).await.is_err() {
+            ProcessOutput::Stdout(data) => {
+                if chan_write.data_bytes(data).await.is_err() {
                     break;
                 }
             }
-            ChannelMsg::Signal { signal } => {
-                if let Some(mapped) = map_signal(&signal) {
-                    let _ = send_signal_to_pid(pid, mapped);
+            ProcessOutput::Stderr(data) => {
+                if chan_write.extended_data_bytes(1, data).await.is_err() {
+                    break;
                 }
             }
+            ProcessOutput::ExitStatus(code) => {
+                exit_status = Some(code);
+            }
+        }
+    }
+
+    input_task.abort();
+    let _ = input_task.await;
+    if let Some(code) = exit_status {
+        let _ = chan_write.exit_status(code).await;
+    }
+    let _ = chan_write.eof().await;
+    let _ = chan_write.close().await;
+    Ok(())
+}
+
+async fn handle_process_input(
+    chan_read: &mut russh::ChannelReadHalf,
+    stream_write: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
+) -> Result<()> {
+    while let Some(message) = chan_read.wait().await {
+        match message {
+            ChannelMsg::Data { data } => {
+                send_process_message(stream_write, &ProcessInput::Data(data.to_vec())).await?;
+            }
+            ChannelMsg::Signal { signal } => {
+                if let Some(signal) = executor::map_signal(&signal) {
+                    send_process_message(stream_write, &ProcessInput::Signal(signal)).await?;
+                }
+            }
+            ChannelMsg::WindowChange {
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+            } => {
+                send_process_message(
+                    stream_write,
+                    &ProcessInput::Resize(SerializablePtySize {
+                        rows: clamp_dimension(row_height),
+                        cols: clamp_dimension(col_width),
+                        pixel_width: clamp_dimension(pix_width),
+                        pixel_height: clamp_dimension(pix_height),
+                    }),
+                )
+                .await?;
+            }
             ChannelMsg::Eof => {
-                let _ = stdin.shutdown().await;
+                send_process_message(stream_write, &ProcessInput::Eof).await?;
             }
             ChannelMsg::Close => {
-                let _ = send_signal_to_pid(pid, Signal::SIGKILL);
+                let _ = send_process_message(stream_write, &ProcessInput::Close).await;
                 break;
             }
             _ => {}
         }
     }
 
-    let _ = stdin.shutdown().await;
+    let _ = stream_write.shutdown().await;
+    Ok(())
 }
 
-async fn read_process_stream<R>(
-    mut stream: R,
-    which: ProcessStream,
-    output_tx: mpsc::UnboundedSender<ProcessOutput>,
-) where
-    R: AsyncRead + Unpin + Send + 'static,
+async fn send_process_message<W>(writer: &mut W, message: &ProcessInput) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
 {
-    let mut buffer = vec![0_u8; 8192];
-
-    loop {
-        match stream.read(&mut buffer).await {
-            Ok(0) => break,
-            Ok(read) => {
-                let chunk = buffer[..read].to_vec();
-                let message = match which {
-                    ProcessStream::Stdout => ProcessOutput::Stdout(chunk),
-                    ProcessStream::Stderr => ProcessOutput::Stderr(chunk),
-                };
-                if output_tx.send(message).is_err() {
-                    break;
-                }
-            }
-            Err(err) => {
-                debug!("process stream read ended: {err}");
-                break;
-            }
-        }
-    }
+    let payload = bincode::serialize(message).context("failed to encode process input")?;
+    let length = u32::try_from(payload.len()).context("process input frame too large")?;
+    writer.write_u32(length).await?;
+    writer.write_all(&payload).await?;
+    Ok(())
 }
 
-async fn proxy_stream(mut channel: russh::ChannelStream<Msg>, mut stream: TcpStream) -> Result<()> {
+async fn read_process_message<R>(reader: &mut R) -> Result<Option<ProcessOutput>>
+where
+    R: AsyncRead + Unpin,
+{
+    let length = match reader.read_u32().await {
+        Ok(length) => length as usize,
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err).context("failed to read process output frame length"),
+    };
+
+    if length > 1024 * 1024 {
+        anyhow::bail!("process output frame length {length} exceeds the supported limit");
+    }
+
+    let mut buffer = vec![0_u8; length];
+    reader
+        .read_exact(&mut buffer)
+        .await
+        .context("failed to read process output frame body")?;
+    let message = bincode::deserialize(&buffer).context("failed to decode process output frame")?;
+    Ok(Some(message))
+}
+
+async fn proxy_stream<A, B>(mut channel: A, mut stream: B) -> Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
     tokio::io::copy_bidirectional(&mut channel, &mut stream)
         .await
         .map(|_| ())
         .map_err(Into::into)
-}
-
-fn run_pty_reader(mut reader: Box<dyn Read + Send>, output_tx: mpsc::UnboundedSender<Vec<u8>>) {
-    let mut buffer = vec![0_u8; 8192];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                if output_tx.send(buffer[..read].to_vec()).is_err() {
-                    break;
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => {
-                debug!("PTY reader ended: {err}");
-                break;
-            }
-        }
-    }
-}
-
-fn run_pty_control(
-    control_rx: std_mpsc::Receiver<PtyControl>,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    mut killer: Box<dyn ChildKiller + Send + Sync>,
-    process_group: Option<i32>,
-) {
-    let mut writer = Some(writer);
-
-    while let Ok(message) = control_rx.recv() {
-        match message {
-            PtyControl::Write(data) => {
-                if let Some(writer) = writer.as_mut() {
-                    if writer.write_all(&data).is_err() || writer.flush().is_err() {
-                        break;
-                    }
-                }
-            }
-            PtyControl::Resize(size) => {
-                let _ = master.resize(size);
-            }
-            PtyControl::Signal(signal) => {
-                if let Some(mapped) = map_signal(&signal) {
-                    if let Some(group) = process_group {
-                        let _ = send_signal_to_process_group(group, mapped);
-                    }
-                }
-            }
-            PtyControl::Eof => {
-                writer.take();
-            }
-            PtyControl::Close => {
-                writer.take();
-                let _ = killer.kill();
-                break;
-            }
-        }
-    }
 }
 
 fn load_or_generate_host_key(path: &PathBuf) -> Result<PrivateKey> {
@@ -1590,6 +1341,33 @@ fn build_child_env(
     }
 
     env
+}
+
+fn to_executor_pty_request(pty: &PtyRequest) -> SerializablePtyRequest {
+    SerializablePtyRequest {
+        term: pty.term.clone(),
+        size: SerializablePtySize {
+            rows: pty.size.rows,
+            cols: pty.size.cols,
+            pixel_width: pty.size.pixel_width,
+            pixel_height: pty.size.pixel_height,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn enable_no_new_privs() -> Result<()> {
+    let result = unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_no_new_privs() -> Result<()> {
+    Ok(())
 }
 
 fn daemon_username() -> Result<String> {
@@ -1727,32 +1505,6 @@ fn clamp_dimension(value: u32) -> u16 {
     value.min(u16::MAX as u32) as u16
 }
 
-fn map_signal(signal: &Sig) -> Option<Signal> {
-    match signal {
-        Sig::ABRT => Some(Signal::SIGABRT),
-        Sig::ALRM => Some(Signal::SIGALRM),
-        Sig::FPE => Some(Signal::SIGFPE),
-        Sig::HUP => Some(Signal::SIGHUP),
-        Sig::ILL => Some(Signal::SIGILL),
-        Sig::INT => Some(Signal::SIGINT),
-        Sig::KILL => Some(Signal::SIGKILL),
-        Sig::PIPE => Some(Signal::SIGPIPE),
-        Sig::QUIT => Some(Signal::SIGQUIT),
-        Sig::SEGV => Some(Signal::SIGSEGV),
-        Sig::TERM => Some(Signal::SIGTERM),
-        Sig::USR1 => Some(Signal::SIGUSR1),
-        Sig::Custom(_) => None,
-    }
-}
-
-fn send_signal_to_pid(pid: u32, signal: Signal) -> Result<()> {
-    kill(Pid::from_raw(pid as i32), signal).context("failed to signal child")
-}
-
-fn send_signal_to_process_group(group: i32, signal: Signal) -> Result<()> {
-    killpg(Pid::from_raw(group), signal).context("failed to signal child process group")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1799,6 +1551,7 @@ mod tests {
             host_key,
             daemon_username: "uli".to_string(),
             home_dir: PathBuf::from("/tmp"),
+            executor: ExecutorClient::inert_for_tests().unwrap(),
             authorized_keys: AuthorizedKeysStore::empty_missing(
                 PathBuf::from("/tmp/authorized_keys"),
                 authorized_keys_max_size,
@@ -1883,20 +1636,4 @@ mod tests {
 
         assert!(handle.await.is_ok());
     }
-}
-
-#[cfg(unix)]
-fn exit_status_code(status: std::process::ExitStatus) -> u32 {
-    use std::os::unix::process::ExitStatusExt;
-
-    status
-        .code()
-        .map(|code| code as u32)
-        .or_else(|| status.signal().map(|signal| 128 + signal as u32))
-        .unwrap_or(255)
-}
-
-#[cfg(not(unix))]
-fn exit_status_code(status: std::process::ExitStatus) -> u32 {
-    status.code().map(|code| code as u32).unwrap_or(255)
 }

@@ -207,14 +207,14 @@ Attack styles mitigated:
 
 ### 8. Pre-Auth Exploit Containment
 
-- [ ] Split the daemon into at least two trust domains: a pre-auth listener/auth process and a post-auth session executor process.
-- [ ] Use a Unix socket or similar IPC to hand off "authenticated and approved" session requests.
-- [ ] Ensure the pre-auth side cannot directly spawn shells, open PTYs, or touch user session state.
+- [x] Split the daemon into at least two trust domains: a pre-auth listener/auth process and a post-auth session executor process.
+- [x] Use a Unix socket or similar IPC to hand off "authenticated and approved" session requests.
+- [x] Ensure the pre-auth side cannot directly spawn shells, open PTYs, or touch user session state.
 - [x] Run the pre-auth side with `no_new_privs`.
 - [ ] Apply seccomp or equivalent syscall filtering to the pre-auth side.
 - [ ] Make the pre-auth side filesystem access read-only except for what is strictly needed.
 - [x] Limit address families on the pre-auth side to what it actually needs.
-- [ ] Keep the post-auth side out of the network parser's direct process boundary.
+- [x] Keep the post-auth side out of the network parser's direct process boundary.
 
 Suggested implementation notes:
 
@@ -274,7 +274,7 @@ These are explicitly out of scope for this roadmap:
 - [x] Phase 3: in-memory `authorized_keys` cache
 - [x] Phase 4: narrow crypto and auth surface
 - [x] Phase 5: bounded buffers and log hardening
-- [ ] Phase 6: pre-auth exploit containment split
+- [x] Phase 6: pre-auth exploit containment split
 - [x] Phase 7: panic isolation and attack-focused integration tests
 
 ## Testing Expectations For The Hardened Design

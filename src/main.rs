@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use narrowd::config::{self, AppConfig, SAMPLE_CONFIG};
+use narrowd::executor;
 use narrowd::sshd;
 
 #[derive(Debug, Parser)]
@@ -19,6 +20,14 @@ struct Cli {
     /// Print a sample config and exit.
     #[arg(long)]
     print_sample_config: bool,
+
+    /// Internal executor process mode.
+    #[arg(long, hide = true)]
+    internal_executor: bool,
+
+    /// Control fd inherited by the internal executor process.
+    #[arg(long, hide = true)]
+    control_fd: Option<i32>,
 }
 
 fn init_logging(level: config::LogLevel) {
@@ -32,25 +41,16 @@ fn init_logging(level: config::LogLevel) {
     builder.init();
 }
 
-#[cfg(target_os = "linux")]
-fn enable_no_new_privs() -> Result<()> {
-    // Prevent this process and its children from gaining privileges via exec.
-    let result = unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().into())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn enable_no_new_privs() -> Result<()> {
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.internal_executor {
+        let control_fd = cli
+            .control_fd
+            .context("missing --control-fd for --internal-executor mode")?;
+        return executor::run_from_control_fd(control_fd).await;
+    }
 
     if cli.print_sample_config {
         print!("{SAMPLE_CONFIG}");
@@ -65,6 +65,5 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    enable_no_new_privs()?;
     sshd::run(config).await
 }
