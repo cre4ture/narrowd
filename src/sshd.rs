@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use getrandom::rand_core::UnwrapErr;
 use log::{debug, error, info, warn};
 use nix::sys::signal::{Signal, kill, killpg};
-use nix::unistd::Pid;
+use nix::unistd::{Pid, User, getuid};
 use portable_pty::{
     Child as PtyChild, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system,
 };
@@ -57,13 +57,20 @@ pub async fn run(config: AppConfig) -> Result<()> {
 struct AppState {
     config: AppConfig,
     host_key: PrivateKey,
+    daemon_username: String,
     home_dir: PathBuf,
+}
+
+struct AuthorizedKeyLookup {
+    matched: bool,
+    ignored_entries: usize,
 }
 
 impl AppState {
     fn bootstrap(config: AppConfig) -> Result<Self> {
         let home_dir = dirs::home_dir().context("unable to determine home directory")?;
         let host_key = load_or_generate_host_key(&config.host_key)?;
+        let daemon_username = daemon_username()?;
 
         if !config.authorized_keys_file.exists() {
             warn!(
@@ -75,13 +82,15 @@ impl AppState {
         Ok(Self {
             config,
             host_key,
+            daemon_username,
             home_dir,
         })
     }
 
     fn is_authorized(&self, offered_key: &ssh_key::PublicKey) -> Result<bool> {
-        let entries = match AuthorizedKeys::read_file(&self.config.authorized_keys_file) {
-            Ok(entries) => entries,
+        let authorized_keys_text = match std::fs::read_to_string(&self.config.authorized_keys_file)
+        {
+            Ok(text) => text,
             Err(err) if !self.config.authorized_keys_file.exists() => {
                 debug!(
                     "authorized keys file {} missing: {err}",
@@ -97,10 +106,53 @@ impl AppState {
             }
         };
 
-        Ok(entries
-            .iter()
-            .any(|entry| entry.public_key().key_data() == offered_key.key_data()))
+        let lookup = lookup_authorized_key(&authorized_keys_text, offered_key).map_err(|err| {
+            anyhow!(
+                "failed to parse {}: {err}",
+                self.config.authorized_keys_file.display()
+            )
+        })?;
+
+        if lookup.ignored_entries > 0 {
+            let label = if lookup.ignored_entries == 1 {
+                "entry"
+            } else {
+                "entries"
+            };
+            warn!(
+                "ignoring {} authorized_keys {} with unsupported options in {}; narrowd accepts only plain key lines",
+                lookup.ignored_entries,
+                label,
+                self.config.authorized_keys_file.display()
+            );
+        }
+
+        Ok(lookup.matched)
     }
+}
+
+fn lookup_authorized_key(
+    authorized_keys_text: &str,
+    offered_key: &ssh_key::PublicKey,
+) -> std::result::Result<AuthorizedKeyLookup, ssh_key::Error> {
+    let mut matched = false;
+    let mut ignored_entries = 0;
+
+    for entry in AuthorizedKeys::new(authorized_keys_text) {
+        let entry = entry?;
+        if entry.config_opts().is_empty() {
+            if entry.public_key().key_data() == offered_key.key_data() {
+                matched = true;
+            }
+        } else {
+            ignored_entries += 1;
+        }
+    }
+
+    Ok(AuthorizedKeyLookup {
+        matched,
+        ignored_entries,
+    })
 }
 
 #[derive(Clone)]
@@ -155,6 +207,15 @@ impl ClientHandler {
 
     fn authorize_key(&mut self, user: &str, public_key: &ssh_key::PublicKey) -> Result<Auth> {
         self.requested_user = Some(user.to_string());
+        if !login_user_matches_daemon(user, &self.state.daemon_username) {
+            warn!(
+                "rejected public key for requested user {user} from {}; narrowd only accepts the daemon user {}",
+                peer_label(self.peer),
+                self.state.daemon_username
+            );
+            return Ok(Auth::reject());
+        }
+
         if self.state.is_authorized(public_key)? {
             info!(
                 "accepted public key for requested user {user} from {}",
@@ -993,9 +1054,9 @@ fn build_child_env(
     env.entry("HOME".to_string())
         .or_insert_with(|| state.home_dir.to_string_lossy().into_owned());
     env.entry("USER".to_string())
-        .or_insert_with(current_username);
+        .or_insert_with(|| state.daemon_username.clone());
     env.entry("LOGNAME".to_string())
-        .or_insert_with(current_username);
+        .or_insert_with(|| state.daemon_username.clone());
     env.entry("SHELL".to_string())
         .or_insert_with(|| state.config.shell.to_string_lossy().into_owned());
 
@@ -1007,8 +1068,16 @@ fn build_child_env(
     env
 }
 
-fn current_username() -> String {
-    std::env::var("USER").unwrap_or_else(|_| "narrowd".to_string())
+fn daemon_username() -> Result<String> {
+    let uid = getuid();
+    let user = User::from_uid(uid)
+        .context("failed to resolve daemon user from current uid")?
+        .ok_or_else(|| anyhow!("no passwd entry for daemon uid {}", uid.as_raw()))?;
+    Ok(user.name)
+}
+
+fn login_user_matches_daemon(requested_user: &str, daemon_username: &str) -> bool {
+    requested_user == daemon_username
 }
 
 fn is_env_allowed(name: &str) -> bool {
@@ -1053,6 +1122,41 @@ fn send_signal_to_pid(pid: u32, signal: Signal) -> Result<()> {
 
 fn send_signal_to_process_group(group: i32, signal: Signal) -> Result<()> {
     killpg(Pid::from_raw(group), signal).context("failed to signal child process group")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PLAIN_ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti user@example.com";
+    const OPTIONED_RSA_ENTRY: &str = "from=\"10.0.0.?,*.example.com\",no-X11-forwarding ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC0WRHtxuxefSJhpIxGq4ibGFgwYnESPm8C3JFM88A1JJLoprenklrd7VJ+VH3Ov/bQwZwLyRU5dRmfR/SWTtIPWs7tToJVayKKDB+/qoXmM5ui/0CU2U4rCdQ6PdaCJdC7yFgpPL8WexjWN06+eSIKYz1AAXbx9rRv1iasslK/KUqtsqzVliagI6jl7FPO2GhRZMcso6LsZGgSxuYf/Lp0D/FcBU8GkeOo1Sx5xEt8H8bJcErtCe4Blb8JxcW6EXO3sReb4z+zcR07gumPgFITZ6hDA8sSNuvo/AlWg0IKTeZSwHHVknWdQqDJ0uczE837caBxyTZllDNIGkBjCIIOFzuTT76HfYc/7CTTGk07uaNkUFXKN79xDiFOX8JQ1ZZMZvGOTwWjuT9CqgdTvQRORbRWwOYv3MH8re9ykw3Ip6lrPifY7s6hOaAKry/nkGPMt40m1TdiW98MTIpooE7W+WXu96ax2l2OJvxX8QR7l+LFlKnkIEEJd/ItF1G22UmOjkVwNASTwza/hlY+8DoVvEmwum/nMgH2TwQT3bTQzF9s9DOJkH4d8p4Mw4gEDjNx0EgUFA91ysCAeUMQQyIvuR8HXXa+VcvhOOO5mmBcVhxJ3qUOJTyDBsT0932Zb4mNtkxdigoVxu+iiwk0vwtvKwGVDYdyMP5EAQeEIP1t0w== user4@example.com";
+    const PLAIN_RSA_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC0WRHtxuxefSJhpIxGq4ibGFgwYnESPm8C3JFM88A1JJLoprenklrd7VJ+VH3Ov/bQwZwLyRU5dRmfR/SWTtIPWs7tToJVayKKDB+/qoXmM5ui/0CU2U4rCdQ6PdaCJdC7yFgpPL8WexjWN06+eSIKYz1AAXbx9rRv1iasslK/KUqtsqzVliagI6jl7FPO2GhRZMcso6LsZGgSxuYf/Lp0D/FcBU8GkeOo1Sx5xEt8H8bJcErtCe4Blb8JxcW6EXO3sReb4z+zcR07gumPgFITZ6hDA8sSNuvo/AlWg0IKTeZSwHHVknWdQqDJ0uczE837caBxyTZllDNIGkBjCIIOFzuTT76HfYc/7CTTGk07uaNkUFXKN79xDiFOX8JQ1ZZMZvGOTwWjuT9CqgdTvQRORbRWwOYv3MH8re9ykw3Ip6lrPifY7s6hOaAKry/nkGPMt40m1TdiW98MTIpooE7W+WXu96ax2l2OJvxX8QR7l+LFlKnkIEEJd/ItF1G22UmOjkVwNASTwza/hlY+8DoVvEmwum/nMgH2TwQT3bTQzF9s9DOJkH4d8p4Mw4gEDjNx0EgUFA91ysCAeUMQQyIvuR8HXXa+VcvhOOO5mmBcVhxJ3qUOJTyDBsT0932Zb4mNtkxdigoVxu+iiwk0vwtvKwGVDYdyMP5EAQeEIP1t0w== user4@example.com";
+
+    #[test]
+    fn matches_plain_authorized_key_entries() {
+        let offered_key: ssh_key::PublicKey = PLAIN_ED25519_KEY.parse().unwrap();
+
+        let lookup = lookup_authorized_key(PLAIN_ED25519_KEY, &offered_key).unwrap();
+
+        assert!(lookup.matched);
+        assert_eq!(lookup.ignored_entries, 0);
+    }
+
+    #[test]
+    fn ignores_authorized_key_entries_with_options() {
+        let offered_key: ssh_key::PublicKey = PLAIN_RSA_KEY.parse().unwrap();
+
+        let lookup = lookup_authorized_key(OPTIONED_RSA_ENTRY, &offered_key).unwrap();
+
+        assert!(!lookup.matched);
+        assert_eq!(lookup.ignored_entries, 1);
+    }
+
+    #[test]
+    fn rejects_non_matching_login_usernames() {
+        assert!(login_user_matches_daemon("uli", "uli"));
+        assert!(!login_user_matches_daemon("root", "uli"));
+    }
 }
 
 #[cfg(unix)]
