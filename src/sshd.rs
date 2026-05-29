@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use getrandom::rand_core::UnwrapErr;
@@ -30,6 +31,7 @@ use tokio::time::{Instant as TokioInstant, Sleep, timeout};
 use crate::admission::{AdmissionConfig, AdmissionController, AdmissionGuard};
 use crate::authorized_keys::AuthorizedKeysCache;
 use crate::config::AppConfig;
+use crate::log_limiter::{LogDecision, LogKey, LogLimiter};
 use crate::sftp::LocalSftp;
 
 pub async fn run(config: AppConfig) -> Result<()> {
@@ -75,6 +77,7 @@ struct AppState {
     home_dir: PathBuf,
     authorized_keys: AuthorizedKeysCache,
     admission: AdmissionController,
+    log_limiter: LogLimiter,
 }
 
 impl AppState {
@@ -124,6 +127,7 @@ impl AppState {
 
         Ok(Self {
             admission: AdmissionController::new(AdmissionConfig::from_app_config(&config)),
+            log_limiter: LogLimiter::new(Duration::from_secs(30), 4096),
             config,
             host_key,
             daemon_username,
@@ -134,6 +138,24 @@ impl AppState {
 
     fn is_authorized(&self, offered_key: &ssh_key::PublicKey) -> Result<bool> {
         self.authorized_keys.contains(offered_key)
+    }
+
+    fn warn_limited(&self, peer: Option<SocketAddr>, category: &'static str, message: String) {
+        let decision = self.log_limiter.check(LogKey {
+            peer_ip: peer.map(|peer| peer.ip()),
+            category,
+        });
+
+        if let LogDecision::Emit { suppressed } = decision {
+            if suppressed == 0 {
+                warn!("{message}");
+            } else {
+                warn!(
+                    "{message}; suppressed {suppressed} similar messages in the last {:?}",
+                    self.log_limiter.window()
+                );
+            }
+        }
     }
 }
 
@@ -296,7 +318,11 @@ async fn serve_connection(
     let admission_guard = match state.admission.try_acquire(peer_addr.ip()) {
         Ok(guard) => guard,
         Err(reason) => {
-            warn!("rejected connection from {peer_addr}: {reason}");
+            state.warn_limited(
+                Some(peer_addr),
+                reason.category(),
+                format!("rejected connection from {peer_addr}: {reason}"),
+            );
             return Ok(());
         }
     };
@@ -327,9 +353,13 @@ async fn serve_connection(
         Ok(Ok(session)) => session,
         Ok(Err(err)) => {
             if is_login_grace_timeout(&err) {
-                warn!(
-                    "closing pre-auth connection from {peer_addr} after login grace timeout of {:?}",
-                    state.config.login_grace_time
+                state.warn_limited(
+                    Some(peer_addr),
+                    "login-grace-timeout",
+                    format!(
+                        "closing pre-auth connection from {peer_addr} after login grace timeout of {:?}",
+                        state.config.login_grace_time
+                    ),
                 );
             } else {
                 debug!("SSH setup from {peer_addr} failed before authentication: {err:#}");
@@ -337,9 +367,13 @@ async fn serve_connection(
             return Ok(());
         }
         Err(_) => {
-            warn!(
-                "timed out waiting for SSH banner from {peer_addr} after {:?}",
-                state.config.client_banner_timeout
+            state.warn_limited(
+                Some(peer_addr),
+                "banner-timeout",
+                format!(
+                    "timed out waiting for SSH banner from {peer_addr} after {:?}",
+                    state.config.client_banner_timeout
+                ),
             );
             return Ok(());
         }
@@ -361,9 +395,13 @@ async fn serve_connection(
         result = &mut running => {
             if let Err(ref err) = result {
                 if is_login_grace_timeout(err) {
-                    warn!(
-                        "closing pre-auth connection from {peer_addr} after login grace timeout of {:?}",
-                        state.config.login_grace_time
+                    state.warn_limited(
+                        Some(peer_addr),
+                        "login-grace-timeout",
+                        format!(
+                            "closing pre-auth connection from {peer_addr} after login grace timeout of {:?}",
+                            state.config.login_grace_time
+                        ),
                     );
                 }
             }
@@ -418,6 +456,7 @@ impl ClientHandler {
         if !login_user_matches_daemon(user, &self.state.daemon_username) {
             self.record_auth_failure(
                 user,
+                "auth-reject-username",
                 &format!(
                     "requested login user does not match daemon user {}",
                     self.state.daemon_username
@@ -429,6 +468,7 @@ impl ClientHandler {
         if !is_user_key_algorithm_allowed(&public_key.algorithm()) {
             self.record_auth_failure(
                 user,
+                "auth-reject-key-algorithm",
                 &format!(
                     "unsupported public key algorithm {:?}",
                     public_key.algorithm()
@@ -444,7 +484,11 @@ impl ClientHandler {
             );
             Ok(Auth::Accept)
         } else {
-            self.record_auth_failure(user, "public key not present in authorized_keys cache");
+            self.record_auth_failure(
+                user,
+                "auth-reject-unknown-key",
+                "public key not present in authorized_keys cache",
+            );
             Ok(Auth::reject())
         }
     }
@@ -461,24 +505,30 @@ impl ClientHandler {
             .ok_or_else(|| anyhow!("unknown channel {channel:?}"))
     }
 
-    fn record_auth_failure(&self, user: &str, reason: &str) {
+    fn record_auth_failure(&self, user: &str, category: &'static str, reason: &str) {
         let Some(peer_ip) = self.peer.map(|peer| peer.ip()) else {
-            warn!("rejected authentication for requested user {user}: {reason}");
+            self.state.warn_limited(
+                self.peer,
+                category,
+                format!("rejected authentication for requested user {user}: {reason}"),
+            );
             return;
         };
 
         let banned = self.state.admission.record_auth_failure(peer_ip);
-        if banned {
-            warn!(
-                "rejected authentication for requested user {user} from {}: {reason}; peer temporarily banned",
-                peer_label(self.peer)
-            );
+        let suffix = if banned {
+            "; peer temporarily banned"
         } else {
-            warn!(
-                "rejected authentication for requested user {user} from {}: {reason}",
+            ""
+        };
+        self.state.warn_limited(
+            self.peer,
+            category,
+            format!(
+                "rejected authentication for requested user {user} from {}: {reason}{suffix}",
                 peer_label(self.peer)
-            );
-        }
+            ),
+        );
     }
 }
 
@@ -510,7 +560,11 @@ impl server::Handler for ClientHandler {
     }
 
     async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
-        self.record_auth_failure(user, "password authentication is disabled");
+        self.record_auth_failure(
+            user,
+            "auth-reject-password",
+            "password authentication is disabled",
+        );
         Ok(Auth::reject())
     }
 
@@ -1473,6 +1527,7 @@ mod tests {
             daemon_username: "uli".to_string(),
             home_dir: PathBuf::from("/tmp"),
             authorized_keys: AuthorizedKeysCache::empty(),
+            log_limiter: LogLimiter::new(Duration::from_secs(30), 64),
         };
 
         let ssh_config = build_ssh_config(&state);

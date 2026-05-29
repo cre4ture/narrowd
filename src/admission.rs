@@ -141,6 +141,18 @@ impl fmt::Display for RejectReason {
     }
 }
 
+impl RejectReason {
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::TooManyUnauthenticatedConnections => "admission-global-limit",
+            Self::TooManyUnauthenticatedConnectionsForIp => "admission-per-ip-limit",
+            Self::TooManyUnauthenticatedConnectionsForSubnet => "admission-per-subnet-limit",
+            Self::ConnectionRateLimited => "admission-rate-limit",
+            Self::TemporarilyBanned => "admission-temporary-ban",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct AdmissionState {
     config: AdmissionConfig,
