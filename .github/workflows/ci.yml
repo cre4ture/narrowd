@@ -100,11 +100,18 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Verify packaged systemd user unit
-        run: systemd-analyze verify packaging/systemd-user/narrowd.service
-
       - name: Build Debian package
         run: ./scripts/build-deb.sh
+
+      - name: Verify packaged systemd user unit
+        run: |
+          package_root="$(mktemp -d)"
+          deb_path="$(find target/debian -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$deb_path"
+          dpkg-deb -x "$deb_path" "$package_root"
+          systemd-analyze --user verify \
+            "$package_root/usr/lib/systemd/user/narrowd.service"
+          rm -rf "$package_root"
 
       - name: Inspect Debian package contents
         run: |
