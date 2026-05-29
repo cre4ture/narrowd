@@ -1,9 +1,13 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
+use std::io::{Error as IoError, ErrorKind, Read, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
+use std::task::{Context as TaskContext, Poll};
 use std::thread;
 
 use anyhow::{Context, Result, anyhow};
@@ -15,20 +19,21 @@ use portable_pty::{
     Child as PtyChild, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system,
 };
 use russh::keys::{Algorithm, PrivateKey, ssh_key};
-use russh::server::{self, Auth, Msg, Server as _, Session};
+use russh::server::{self, Auth, Msg, Session};
 use russh::{Channel, ChannelId, ChannelMsg, MethodKind, MethodSet, Sig};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Instant as TokioInstant, Sleep, timeout};
 
+use crate::admission::{AdmissionConfig, AdmissionController, AdmissionGuard};
 use crate::authorized_keys::AuthorizedKeysCache;
 use crate::config::AppConfig;
 use crate::sftp::LocalSftp;
 
 pub async fn run(config: AppConfig) -> Result<()> {
     let state = Arc::new(AppState::bootstrap(config)?);
-    let bind_target = (state.config.listen_address.as_str(), state.config.port);
 
     info!(
         "starting narrowd on {}:{} with host key {}",
@@ -37,16 +42,30 @@ pub async fn run(config: AppConfig) -> Result<()> {
         state.config.host_key.display()
     );
 
-    let mut server = NarrowServer {
-        state: Arc::clone(&state),
-    };
+    let listener =
+        TcpListener::bind((state.config.listen_address.as_str(), state.config.port)).await?;
+    run_with_listener(state, listener).await
+}
 
+pub async fn run_on_listener(config: AppConfig, listener: TcpListener) -> Result<()> {
+    let state = Arc::new(AppState::bootstrap(config)?);
+    run_with_listener(state, listener).await
+}
+
+async fn run_with_listener(state: Arc<AppState>, listener: TcpListener) -> Result<()> {
     let ssh_config = Arc::new(build_ssh_config(&state));
 
-    server
-        .run_on_address(ssh_config, bind_target)
-        .await
-        .map_err(Into::into)
+    loop {
+        let (socket, peer_addr) = listener.accept().await?;
+        let state = Arc::clone(&state);
+        let ssh_config = Arc::clone(&ssh_config);
+
+        tokio::spawn(async move {
+            if let Err(err) = serve_connection(state, ssh_config, socket, peer_addr).await {
+                warn!("connection from {peer_addr} ended with error: {err:#}");
+            }
+        });
+    }
 }
 
 struct AppState {
@@ -55,6 +74,7 @@ struct AppState {
     daemon_username: String,
     home_dir: PathBuf,
     authorized_keys: AuthorizedKeysCache,
+    admission: AdmissionController,
 }
 
 impl AppState {
@@ -103,6 +123,7 @@ impl AppState {
         }
 
         Ok(Self {
+            admission: AdmissionController::new(AdmissionConfig::from_app_config(&config)),
             config,
             host_key,
             daemon_username,
@@ -116,17 +137,241 @@ impl AppState {
     }
 }
 
-#[derive(Clone)]
-struct NarrowServer {
-    state: Arc<AppState>,
+struct PreauthContext {
+    admission_guard: Option<AdmissionGuard>,
+    auth_success_tx: Option<oneshot::Sender<()>>,
+    authenticated: Arc<AtomicBool>,
 }
 
-impl server::Server for NarrowServer {
-    type Handler = ClientHandler;
-
-    fn new_client(&mut self, peer: Option<std::net::SocketAddr>) -> Self::Handler {
-        ClientHandler::new(Arc::clone(&self.state), peer)
+impl PreauthContext {
+    fn new(
+        admission_guard: AdmissionGuard,
+        auth_success_tx: oneshot::Sender<()>,
+        authenticated: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            admission_guard: Some(admission_guard),
+            auth_success_tx: Some(auth_success_tx),
+            authenticated,
+        }
     }
+
+    fn mark_authenticated(&mut self) {
+        self.authenticated.store(true, Ordering::Relaxed);
+
+        if let Some(guard) = self.admission_guard.take() {
+            guard.mark_authenticated();
+        }
+
+        if let Some(tx) = self.auth_success_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+struct LoginGraceStream<S> {
+    inner: S,
+    deadline: TokioInstant,
+    authenticated: Arc<AtomicBool>,
+    timer: Pin<Box<Sleep>>,
+}
+
+impl<S> LoginGraceStream<S> {
+    fn new(inner: S, deadline: TokioInstant, authenticated: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            deadline,
+            authenticated,
+            timer: Box::pin(tokio::time::sleep_until(deadline)),
+        }
+    }
+
+    fn is_authenticated(&self) -> bool {
+        self.authenticated.load(Ordering::Relaxed)
+    }
+
+    fn preauth_timeout_error() -> IoError {
+        IoError::new(
+            ErrorKind::TimedOut,
+            "login grace time exceeded before authentication completed",
+        )
+    }
+
+    fn poll_deadline(&mut self, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        if self.is_authenticated() {
+            return Poll::Pending;
+        }
+
+        if TokioInstant::now() >= self.deadline {
+            return Poll::Ready(Err(Self::preauth_timeout_error()));
+        }
+
+        match self.timer.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(Self::preauth_timeout_error())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> AsyncRead for LoginGraceStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.is_authenticated() {
+            return Pin::new(&mut self.inner).poll_read(cx, buf);
+        }
+
+        if TokioInstant::now() >= self.deadline {
+            return Poll::Ready(Err(Self::preauth_timeout_error()));
+        }
+
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => self.poll_deadline(cx),
+        }
+    }
+}
+
+impl<S> AsyncWrite for LoginGraceStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.is_authenticated() {
+            return Pin::new(&mut self.inner).poll_write(cx, buf);
+        }
+
+        if TokioInstant::now() >= self.deadline {
+            return Poll::Ready(Err(Self::preauth_timeout_error()));
+        }
+
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => match self.poll_deadline(cx) {
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(0)),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        if self.is_authenticated() {
+            return Pin::new(&mut self.inner).poll_flush(cx);
+        }
+
+        if TokioInstant::now() >= self.deadline {
+            return Poll::Ready(Err(Self::preauth_timeout_error()));
+        }
+
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => self.poll_deadline(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+async fn serve_connection(
+    state: Arc<AppState>,
+    ssh_config: Arc<server::Config>,
+    socket: TcpStream,
+    peer_addr: SocketAddr,
+) -> Result<()> {
+    let admission_guard = match state.admission.try_acquire(peer_addr.ip()) {
+        Ok(guard) => guard,
+        Err(reason) => {
+            warn!("rejected connection from {peer_addr}: {reason}");
+            return Ok(());
+        }
+    };
+
+    if ssh_config.nodelay {
+        if let Err(err) = socket.set_nodelay(true) {
+            warn!("failed to enable TCP_NODELAY for {peer_addr}: {err}");
+        }
+    }
+
+    let accepted_at = TokioInstant::now();
+    let login_deadline = accepted_at + state.config.login_grace_time;
+    let (auth_success_tx, mut auth_success_rx) = oneshot::channel();
+    let authenticated = Arc::new(AtomicBool::new(false));
+    let handler = ClientHandler::new(
+        Arc::clone(&state),
+        Some(peer_addr),
+        PreauthContext::new(admission_guard, auth_success_tx, Arc::clone(&authenticated)),
+    );
+    let stream = LoginGraceStream::new(socket, login_deadline, authenticated);
+
+    let running = match timeout(
+        state.config.client_banner_timeout,
+        server::run_stream(ssh_config, stream, handler),
+    )
+    .await
+    {
+        Ok(Ok(session)) => session,
+        Ok(Err(err)) => {
+            if is_login_grace_timeout(&err) {
+                warn!(
+                    "closing pre-auth connection from {peer_addr} after login grace timeout of {:?}",
+                    state.config.login_grace_time
+                );
+            } else {
+                debug!("SSH setup from {peer_addr} failed before authentication: {err:#}");
+            }
+            return Ok(());
+        }
+        Err(_) => {
+            warn!(
+                "timed out waiting for SSH banner from {peer_addr} after {:?}",
+                state.config.client_banner_timeout
+            );
+            return Ok(());
+        }
+    };
+
+    tokio::pin!(running);
+
+    tokio::select! {
+        result = &mut auth_success_rx => {
+            if result.is_ok() {
+                info!(
+                    "authentication completed for {peer_addr} in {:?}",
+                    accepted_at.elapsed()
+                );
+            }
+
+            running.await?;
+        }
+        result = &mut running => {
+            if let Err(ref err) = result {
+                if is_login_grace_timeout(err) {
+                    warn!(
+                        "closing pre-auth connection from {peer_addr} after login grace timeout of {:?}",
+                        state.config.login_grace_time
+                    );
+                }
+            }
+            result?;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]
@@ -149,17 +394,19 @@ struct PtyRequest {
 
 struct ClientHandler {
     state: Arc<AppState>,
-    peer: Option<std::net::SocketAddr>,
+    peer: Option<SocketAddr>,
+    preauth: PreauthContext,
     pending_channels: HashMap<ChannelId, PendingChannel>,
     remote_forwards: HashMap<ForwardKey, tokio::task::JoinHandle<()>>,
     requested_user: Option<String>,
 }
 
 impl ClientHandler {
-    fn new(state: Arc<AppState>, peer: Option<std::net::SocketAddr>) -> Self {
+    fn new(state: Arc<AppState>, peer: Option<SocketAddr>, preauth: PreauthContext) -> Self {
         Self {
             state,
             peer,
+            preauth,
             pending_channels: HashMap::new(),
             remote_forwards: HashMap::new(),
             requested_user: None,
@@ -169,19 +416,23 @@ impl ClientHandler {
     fn authorize_key(&mut self, user: &str, public_key: &ssh_key::PublicKey) -> Result<Auth> {
         self.requested_user = Some(user.to_string());
         if !login_user_matches_daemon(user, &self.state.daemon_username) {
-            warn!(
-                "rejected public key for requested user {user} from {}; narrowd only accepts the daemon user {}",
-                peer_label(self.peer),
-                self.state.daemon_username
+            self.record_auth_failure(
+                user,
+                &format!(
+                    "requested login user does not match daemon user {}",
+                    self.state.daemon_username
+                ),
             );
             return Ok(Auth::reject());
         }
 
         if !is_user_key_algorithm_allowed(&public_key.algorithm()) {
-            warn!(
-                "rejected public key using unsupported algorithm {:?} for requested user {user} from {}",
-                public_key.algorithm(),
-                peer_label(self.peer)
+            self.record_auth_failure(
+                user,
+                &format!(
+                    "unsupported public key algorithm {:?}",
+                    public_key.algorithm()
+                ),
             );
             return Ok(Auth::reject());
         }
@@ -193,10 +444,7 @@ impl ClientHandler {
             );
             Ok(Auth::Accept)
         } else {
-            warn!(
-                "rejected public key for requested user {user} from {}",
-                peer_label(self.peer)
-            );
+            self.record_auth_failure(user, "public key not present in authorized_keys cache");
             Ok(Auth::reject())
         }
     }
@@ -211,6 +459,26 @@ impl ClientHandler {
         self.pending_channels
             .remove(&channel)
             .ok_or_else(|| anyhow!("unknown channel {channel:?}"))
+    }
+
+    fn record_auth_failure(&self, user: &str, reason: &str) {
+        let Some(peer_ip) = self.peer.map(|peer| peer.ip()) else {
+            warn!("rejected authentication for requested user {user}: {reason}");
+            return;
+        };
+
+        let banned = self.state.admission.record_auth_failure(peer_ip);
+        if banned {
+            warn!(
+                "rejected authentication for requested user {user} from {}: {reason}; peer temporarily banned",
+                peer_label(self.peer)
+            );
+        } else {
+            warn!(
+                "rejected authentication for requested user {user} from {}: {reason}",
+                peer_label(self.peer)
+            );
+        }
     }
 }
 
@@ -242,14 +510,12 @@ impl server::Handler for ClientHandler {
     }
 
     async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
-        warn!(
-            "password auth rejected for requested user {user} from {}",
-            peer_label(self.peer)
-        );
+        self.record_auth_failure(user, "password authentication is disabled");
         Ok(Auth::reject())
     }
 
     async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
+        self.preauth.mark_authenticated();
         info!(
             "session authenticated for requested user {} from {}",
             self.requested_user.as_deref().unwrap_or("<unknown>"),
@@ -1099,6 +1365,19 @@ fn peer_label(peer: Option<std::net::SocketAddr>) -> String {
         .unwrap_or_else(|| "<unknown peer>".to_string())
 }
 
+fn is_login_grace_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                io_err.kind() == ErrorKind::TimedOut
+                    && io_err
+                        .to_string()
+                        .contains("login grace time exceeded before authentication completed")
+            })
+    })
+}
+
 fn clamp_dimension(value: u32) -> u16 {
     let value = value.max(1);
     value.min(u16::MAX as u32) as u16
@@ -1168,6 +1447,7 @@ mod tests {
         let host_key =
             PrivateKey::random(&mut UnwrapErr(getrandom::SysRng), Algorithm::Ed25519).unwrap();
         let state = AppState {
+            admission: AdmissionController::new(AdmissionConfig::from_app_config(&config)),
             config,
             host_key,
             daemon_username: "uli".to_string(),

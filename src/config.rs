@@ -24,10 +24,18 @@ AllowRemoteForwarding yes
 GatewayPorts yes
 
 # Public exposure hardening defaults
+MaxUnauthConnectionsGlobal 16
+MaxUnauthConnectionsPerIp 3
+MaxUnauthConnectionsPerSubnet 8
+NewConnectionsPerMinutePerIp 12
+NewConnectionsBurstPerIp 4
 LoginGraceTime 15s
 ClientBannerTimeout 5s
 MaxAuthAttempts 4
 AuthRejectionTime 2s
+AuthFailureBanThreshold 8
+AuthFailureBanWindow 10m
+AuthFailureBanDuration 15m
 InactivityTimeout 15m
 KeepaliveInterval 30s
 KeepaliveMax 3
@@ -100,10 +108,18 @@ pub struct AppConfig {
     pub allow_tcp_forwarding: bool,
     pub allow_remote_forwarding: bool,
     pub gateway_ports: bool,
+    pub max_unauth_connections_global: usize,
+    pub max_unauth_connections_per_ip: usize,
+    pub max_unauth_connections_per_subnet: usize,
+    pub new_connections_per_minute_per_ip: usize,
+    pub new_connections_burst_per_ip: usize,
     pub login_grace_time: Duration,
     pub client_banner_timeout: Duration,
     pub max_auth_attempts: usize,
     pub auth_rejection_time: Duration,
+    pub auth_failure_ban_threshold: usize,
+    pub auth_failure_ban_window: Duration,
+    pub auth_failure_ban_duration: Duration,
     pub inactivity_timeout: Duration,
     pub keepalive_interval: Duration,
     pub keepalive_max: usize,
@@ -150,10 +166,18 @@ impl AppConfig {
             allow_tcp_forwarding: true,
             allow_remote_forwarding: true,
             gateway_ports: true,
+            max_unauth_connections_global: 16,
+            max_unauth_connections_per_ip: 3,
+            max_unauth_connections_per_subnet: 8,
+            new_connections_per_minute_per_ip: 12,
+            new_connections_burst_per_ip: 4,
             login_grace_time: Duration::from_secs(15),
             client_banner_timeout: Duration::from_secs(5),
             max_auth_attempts: 4,
             auth_rejection_time: Duration::from_secs(2),
+            auth_failure_ban_threshold: 8,
+            auth_failure_ban_window: Duration::from_secs(10 * 60),
+            auth_failure_ban_duration: Duration::from_secs(15 * 60),
             inactivity_timeout: Duration::from_secs(15 * 60),
             keepalive_interval: Duration::from_secs(30),
             keepalive_max: 3,
@@ -232,6 +256,36 @@ impl AppConfig {
                     self.gateway_ports = parse_bool(values[0])
                         .with_context(|| format!("invalid GatewayPorts on line {line_number}"))?;
                 }
+                "maxunauthconnectionsglobal" => {
+                    self.max_unauth_connections_global =
+                        values[0].parse::<usize>().with_context(|| {
+                            format!("invalid MaxUnauthConnectionsGlobal on line {line_number}")
+                        })?;
+                }
+                "maxunauthconnectionsperip" => {
+                    self.max_unauth_connections_per_ip =
+                        values[0].parse::<usize>().with_context(|| {
+                            format!("invalid MaxUnauthConnectionsPerIp on line {line_number}")
+                        })?;
+                }
+                "maxunauthconnectionspersubnet" => {
+                    self.max_unauth_connections_per_subnet =
+                        values[0].parse::<usize>().with_context(|| {
+                            format!("invalid MaxUnauthConnectionsPerSubnet on line {line_number}")
+                        })?;
+                }
+                "newconnectionsperminuteperip" => {
+                    self.new_connections_per_minute_per_ip =
+                        values[0].parse::<usize>().with_context(|| {
+                            format!("invalid NewConnectionsPerMinutePerIp on line {line_number}")
+                        })?;
+                }
+                "newconnectionsburstperip" => {
+                    self.new_connections_burst_per_ip =
+                        values[0].parse::<usize>().with_context(|| {
+                            format!("invalid NewConnectionsBurstPerIp on line {line_number}")
+                        })?;
+                }
                 "logingracetime" => {
                     self.login_grace_time = parse_duration(values[0])
                         .with_context(|| format!("invalid LoginGraceTime on line {line_number}"))?;
@@ -250,6 +304,24 @@ impl AppConfig {
                     self.auth_rejection_time = parse_duration(values[0]).with_context(|| {
                         format!("invalid AuthRejectionTime on line {line_number}")
                     })?;
+                }
+                "authfailurebanthreshold" => {
+                    self.auth_failure_ban_threshold =
+                        values[0].parse::<usize>().with_context(|| {
+                            format!("invalid AuthFailureBanThreshold on line {line_number}")
+                        })?;
+                }
+                "authfailurebanwindow" => {
+                    self.auth_failure_ban_window =
+                        parse_duration(values[0]).with_context(|| {
+                            format!("invalid AuthFailureBanWindow on line {line_number}")
+                        })?;
+                }
+                "authfailurebanduration" => {
+                    self.auth_failure_ban_duration =
+                        parse_duration(values[0]).with_context(|| {
+                            format!("invalid AuthFailureBanDuration on line {line_number}")
+                        })?;
                 }
                 "inactivitytimeout" => {
                     self.inactivity_timeout = parse_duration(values[0]).with_context(|| {
@@ -441,6 +513,22 @@ mod tests {
         assert_eq!(config.listen_address, "127.0.0.1");
         assert_eq!(config.login_grace_time, Duration::from_secs(20));
         assert_eq!(config.authorized_keys_max_size, 64 * 1024);
+    }
+
+    #[test]
+    fn parses_public_exposure_limits() {
+        let mut config = AppConfig::defaults().unwrap();
+        config
+            .apply_text(
+                "MaxUnauthConnectionsGlobal 10\nMaxUnauthConnectionsPerIp 2\nAuthFailureBanThreshold 5\nAuthFailureBanWindow 30s\n",
+                Path::new("/tmp"),
+            )
+            .unwrap();
+
+        assert_eq!(config.max_unauth_connections_global, 10);
+        assert_eq!(config.max_unauth_connections_per_ip, 2);
+        assert_eq!(config.auth_failure_ban_threshold, 5);
+        assert_eq!(config.auth_failure_ban_window, Duration::from_secs(30));
     }
 
     #[test]
