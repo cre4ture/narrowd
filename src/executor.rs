@@ -13,6 +13,7 @@ use std::thread;
 use anyhow::{Context, Result, anyhow};
 use log::{debug, warn};
 use nix::cmsg_space;
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::libc;
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::sys::socket::{
@@ -299,9 +300,11 @@ impl ExecutorClient {
             AddressFamily::Unix,
             SockType::SeqPacket,
             None,
-            SockFlag::SOCK_CLOEXEC,
+            SockFlag::empty(),
         )
         .context("failed to create executor control socket pair")?;
+        set_cloexec(&parent_fd)?;
+        set_cloexec(&child_fd)?;
 
         let child_raw_fd = child_fd.as_raw_fd();
         let mut command = StdCommand::new(executor_program()?);
@@ -439,9 +442,11 @@ impl ExecutorClient {
             AddressFamily::Unix,
             SockType::SeqPacket,
             None,
-            SockFlag::SOCK_CLOEXEC,
+            SockFlag::empty(),
         )
         .context("failed to create inert executor control socket")?;
+        set_cloexec(&reader_fd)?;
+        set_cloexec(&writer_fd)?;
         drop(reader_fd);
         Ok(Self {
             inner: Arc::new(ExecutorClientInner {
@@ -1295,6 +1300,15 @@ fn unix_service_channel() -> Result<(UnixStream, OwnedFd)> {
     let (parent, child) = StdUnixStream::pair().context("failed to create Unix service stream")?;
     let parent = unix_stream_from_std(parent)?;
     Ok((parent, child.into()))
+}
+
+fn set_cloexec(fd: &OwnedFd) -> Result<()> {
+    let current_flags =
+        fcntl(fd, FcntlArg::F_GETFD).context("failed to read socket close-on-exec flags")?;
+    let updated_flags = FdFlag::from_bits_truncate(current_flags) | FdFlag::FD_CLOEXEC;
+    fcntl(fd, FcntlArg::F_SETFD(updated_flags))
+        .context("failed to set socket close-on-exec flag")?;
+    Ok(())
 }
 
 fn unix_stream_from_fd(fd: OwnedFd) -> Result<UnixStream> {
