@@ -46,6 +46,7 @@ MaximumPacketSize 32768
 NoDelay yes
 AuthorizedKeysMaxSize 256KiB
 AuthorizedKeysMaxEntries 128
+AuthorizedKeysReloadInterval 2s
 
 LogLevel info
 ";
@@ -130,6 +131,7 @@ pub struct AppConfig {
     pub nodelay: bool,
     pub authorized_keys_max_size: usize,
     pub authorized_keys_max_entries: usize,
+    pub authorized_keys_reload_interval: Duration,
     pub log_level: LogLevel,
 }
 
@@ -188,6 +190,7 @@ impl AppConfig {
             nodelay: true,
             authorized_keys_max_size: 256 * 1024,
             authorized_keys_max_entries: 128,
+            authorized_keys_reload_interval: Duration::from_secs(2),
             log_level: LogLevel::Info,
         })
     }
@@ -374,6 +377,12 @@ impl AppConfig {
                             format!("invalid AuthorizedKeysMaxEntries on line {line_number}")
                         })?;
                 }
+                "authorizedkeysreloadinterval" => {
+                    self.authorized_keys_reload_interval =
+                        parse_duration(values[0]).with_context(|| {
+                            format!("invalid AuthorizedKeysReloadInterval on line {line_number}")
+                        })?;
+                }
                 "pubkeyauthentication" => {
                     let enabled = parse_bool(values[0]).with_context(|| {
                         format!("invalid PubkeyAuthentication on line {line_number}")
@@ -520,7 +529,7 @@ mod tests {
         let mut config = AppConfig::defaults().unwrap();
         config
             .apply_text(
-                "MaxUnauthConnectionsGlobal 10\nMaxUnauthConnectionsPerIp 2\nAuthFailureBanThreshold 5\nAuthFailureBanWindow 30s\n",
+                "MaxUnauthConnectionsGlobal 10\nMaxUnauthConnectionsPerIp 2\nAuthFailureBanThreshold 5\nAuthFailureBanWindow 30s\nAuthorizedKeysReloadInterval 3s\n",
                 Path::new("/tmp"),
             )
             .unwrap();
@@ -529,6 +538,10 @@ mod tests {
         assert_eq!(config.max_unauth_connections_per_ip, 2);
         assert_eq!(config.auth_failure_ban_threshold, 5);
         assert_eq!(config.auth_failure_ban_window, Duration::from_secs(30));
+        assert_eq!(
+            config.authorized_keys_reload_interval,
+            Duration::from_secs(3)
+        );
     }
 
     #[test]

@@ -1,17 +1,206 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use russh::keys::ssh_key::{self, AuthorizedKeys};
 
 #[derive(Clone, Debug)]
-pub struct AuthorizedKeysCache {
+pub struct AuthorizedKeysStore {
+    inner: Arc<RwLock<AuthorizedKeysState>>,
+}
+
+impl AuthorizedKeysStore {
+    pub fn load(
+        path: PathBuf,
+        max_size: usize,
+        max_entries: usize,
+        reload_interval: Duration,
+    ) -> Result<Self> {
+        let (cache, fingerprint) = AuthorizedKeysCache::load(&path, max_size, max_entries)?;
+        Ok(Self::new(AuthorizedKeysState::loaded(
+            path,
+            max_size,
+            max_entries,
+            reload_interval,
+            cache,
+            fingerprint,
+        )))
+    }
+
+    pub fn empty_missing(
+        path: PathBuf,
+        max_size: usize,
+        max_entries: usize,
+        reload_interval: Duration,
+    ) -> Self {
+        Self::new(AuthorizedKeysState::missing(
+            path,
+            max_size,
+            max_entries,
+            reload_interval,
+        ))
+    }
+
+    fn new(state: AuthorizedKeysState) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(state)),
+        }
+    }
+
+    pub fn refresh_if_due(&self) -> Result<Option<AuthorizedKeysReloadEvent>> {
+        let now = Instant::now();
+        let mut state = self.inner.write().expect("authorized keys lock poisoned");
+        state.refresh_if_due(now)
+    }
+
+    pub fn contains(&self, public_key: &ssh_key::PublicKey) -> Result<bool> {
+        let state = self.inner.read().expect("authorized keys lock poisoned");
+        state.cache.contains(public_key)
+    }
+
+    pub fn status(&self) -> AuthorizedKeysStatus {
+        let state = self.inner.read().expect("authorized keys lock poisoned");
+        AuthorizedKeysStatus {
+            generation: state.generation,
+            ignored_entries: state.cache.ignored_entries(),
+            last_reload_status: state.last_reload_status.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedKeysStatus {
+    pub generation: u64,
+    pub ignored_entries: usize,
+    pub last_reload_status: AuthorizedKeysReloadStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorizedKeysReloadStatus {
+    Loaded,
+    Missing,
+    Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorizedKeysReloadEvent {
+    Loaded {
+        generation: u64,
+        ignored_entries: usize,
+    },
+    Missing,
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct AuthorizedKeysState {
+    path: PathBuf,
+    max_size: usize,
+    max_entries: usize,
+    reload_interval: Duration,
+    cache: AuthorizedKeysCache,
+    generation: u64,
+    observed_fingerprint: AuthorizedKeysFingerprint,
+    last_reload_status: AuthorizedKeysReloadStatus,
+    next_reload_check_at: Instant,
+}
+
+impl AuthorizedKeysState {
+    fn loaded(
+        path: PathBuf,
+        max_size: usize,
+        max_entries: usize,
+        reload_interval: Duration,
+        cache: AuthorizedKeysCache,
+        fingerprint: AuthorizedKeysFingerprint,
+    ) -> Self {
+        Self {
+            path,
+            max_size,
+            max_entries,
+            reload_interval,
+            cache,
+            generation: 1,
+            observed_fingerprint: fingerprint,
+            last_reload_status: AuthorizedKeysReloadStatus::Loaded,
+            next_reload_check_at: Instant::now() + reload_interval,
+        }
+    }
+
+    fn missing(
+        path: PathBuf,
+        max_size: usize,
+        max_entries: usize,
+        reload_interval: Duration,
+    ) -> Self {
+        Self {
+            path,
+            max_size,
+            max_entries,
+            reload_interval,
+            cache: AuthorizedKeysCache::empty(),
+            generation: 0,
+            observed_fingerprint: AuthorizedKeysFingerprint::MISSING,
+            last_reload_status: AuthorizedKeysReloadStatus::Missing,
+            next_reload_check_at: Instant::now() + reload_interval,
+        }
+    }
+
+    fn refresh_if_due(&mut self, now: Instant) -> Result<Option<AuthorizedKeysReloadEvent>> {
+        if now < self.next_reload_check_at {
+            return Ok(None);
+        }
+        self.next_reload_check_at = now + self.reload_interval;
+
+        let current_fingerprint = AuthorizedKeysFingerprint::from_path(&self.path)?;
+        if current_fingerprint == self.observed_fingerprint {
+            return Ok(None);
+        }
+        self.observed_fingerprint = current_fingerprint;
+
+        match AuthorizedKeysCache::load(&self.path, self.max_size, self.max_entries) {
+            Ok((cache, fingerprint)) => {
+                self.cache = cache;
+                self.generation = self.generation.saturating_add(1);
+                self.observed_fingerprint = fingerprint;
+                self.last_reload_status = AuthorizedKeysReloadStatus::Loaded;
+                Ok(Some(AuthorizedKeysReloadEvent::Loaded {
+                    generation: self.generation,
+                    ignored_entries: self.cache.ignored_entries(),
+                }))
+            }
+            Err(_)
+                if matches!(
+                    self.observed_fingerprint,
+                    AuthorizedKeysFingerprint::MISSING
+                ) =>
+            {
+                self.last_reload_status = AuthorizedKeysReloadStatus::Missing;
+                Ok(Some(AuthorizedKeysReloadEvent::Missing))
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.last_reload_status = AuthorizedKeysReloadStatus::Failed(message.clone());
+                Ok(Some(AuthorizedKeysReloadEvent::Failed(message)))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AuthorizedKeysCache {
     accepted_keys: HashSet<Vec<u8>>,
     ignored_entries: usize,
 }
 
 impl AuthorizedKeysCache {
-    pub fn load(path: &Path, max_size: usize, max_entries: usize) -> Result<Self> {
+    fn load(
+        path: &Path,
+        max_size: usize,
+        max_entries: usize,
+    ) -> Result<(Self, AuthorizedKeysFingerprint)> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         if text.len() > max_size {
@@ -22,29 +211,31 @@ impl AuthorizedKeysCache {
             );
         }
 
-        Self::from_text(&text, max_entries)
+        let cache = Self::from_text(&text, max_entries)?;
+        let fingerprint = AuthorizedKeysFingerprint::from_path(path)?;
+        Ok((cache, fingerprint))
     }
 
-    pub fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             accepted_keys: HashSet::new(),
             ignored_entries: 0,
         }
     }
 
-    pub fn contains(&self, public_key: &ssh_key::PublicKey) -> Result<bool> {
+    fn contains(&self, public_key: &ssh_key::PublicKey) -> Result<bool> {
         let key_bytes = public_key
             .to_bytes()
             .context("failed to serialize offered public key")?;
         Ok(self.accepted_keys.contains(&key_bytes))
     }
 
-    pub fn ignored_entries(&self) -> usize {
+    fn ignored_entries(&self) -> usize {
         self.ignored_entries
     }
 
     #[cfg(test)]
-    pub fn key_count(&self) -> usize {
+    fn key_count(&self) -> usize {
         self.accepted_keys.len()
     }
 
@@ -80,11 +271,41 @@ impl AuthorizedKeysCache {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthorizedKeysFingerprint {
+    modified: Option<SystemTime>,
+    len: Option<u64>,
+    missing: bool,
+}
+
+impl AuthorizedKeysFingerprint {
+    fn from_path(path: &Path) -> Result<Self> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(Self {
+                modified: metadata.modified().ok(),
+                len: Some(metadata.len()),
+                missing: false,
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::MISSING),
+            Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
+        }
+    }
+
+    const MISSING: Self = Self {
+        modified: None,
+        len: None,
+        missing: true,
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     const PLAIN_ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti user@example.com";
+    const SECOND_ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKkBZe9F+Q52g8f+k38RXvJY8A8+P9MNm+8cTxS55U8W second@example.com";
     const OPTIONED_RSA_ENTRY: &str = "from=\"10.0.0.?,*.example.com\",no-X11-forwarding ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC0WRHtxuxefSJhpIxGq4ibGFgwYnESPm8C3JFM88A1JJLoprenklrd7VJ+VH3Ov/bQwZwLyRU5dRmfR/SWTtIPWs7tToJVayKKDB+/qoXmM5ui/0CU2U4rCdQ6PdaCJdC7yFgpPL8WexjWN06+eSIKYz1AAXbx9rRv1iasslK/KUqtsqzVliagI6jl7FPO2GhRZMcso6LsZGgSxuYf/Lp0D/FcBU8GkeOo1Sx5xEt8H8bJcErtCe4Blb8JxcW6EXO3sReb4z+zcR07gumPgFITZ6hDA8sSNuvo/AlWg0IKTeZSwHHVknWdQqDJ0uczE837caBxyTZllDNIGkBjCIIOFzuTT76HfYc/7CTTGk07uaNkUFXKN79xDiFOX8JQ1ZZMZvGOTwWjuT9CqgdTvQRORbRWwOYv3MH8re9ykw3Ip6lrPifY7s6hOaAKry/nkGPMt40m1TdiW98MTIpooE7W+WXu96ax2l2OJvxX8QR7l+LFlKnkIEEJd/ItF1G22UmOjkVwNASTwza/hlY+8DoVvEmwum/nMgH2TwQT3bTQzF9s9DOJkH4d8p4Mw4gEDjNx0EgUFA91ysCAeUMQQyIvuR8HXXa+VcvhOOO5mmBcVhxJ3qUOJTyDBsT0932Zb4mNtkxdigoVxu+iiwk0vwtvKwGVDYdyMP5EAQeEIP1t0w== user4@example.com";
     const DUPLICATE_KEYS: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti user@example.com\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti second@example.com\n";
 
@@ -112,5 +333,93 @@ mod tests {
     fn rejects_too_many_entries() {
         let err = AuthorizedKeysCache::from_text(PLAIN_ED25519_KEY, 0).unwrap_err();
         assert!(err.to_string().contains("entry limit"));
+    }
+
+    #[test]
+    fn reloads_after_file_change() {
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path().join("authorized_keys");
+        fs::write(&path, format!("{PLAIN_ED25519_KEY}\n")).unwrap();
+
+        let store =
+            AuthorizedKeysStore::load(path.clone(), 1024, 8, Duration::from_millis(0)).unwrap();
+        let first_key: ssh_key::PublicKey = PLAIN_ED25519_KEY.parse().unwrap();
+        let second_key: ssh_key::PublicKey = SECOND_ED25519_KEY.parse().unwrap();
+        assert!(store.contains(&first_key).unwrap());
+        assert!(!store.contains(&second_key).unwrap());
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&path, format!("{SECOND_ED25519_KEY}\n")).unwrap();
+
+        let event = store.refresh_if_due().unwrap();
+        assert_eq!(
+            event,
+            Some(AuthorizedKeysReloadEvent::Loaded {
+                generation: 2,
+                ignored_entries: 0
+            })
+        );
+        assert!(!store.contains(&first_key).unwrap());
+        assert!(store.contains(&second_key).unwrap());
+    }
+
+    #[test]
+    fn keeps_last_known_good_cache_when_reload_fails() {
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path().join("authorized_keys");
+        fs::write(&path, format!("{PLAIN_ED25519_KEY}\n")).unwrap();
+
+        let store =
+            AuthorizedKeysStore::load(path.clone(), 1024, 8, Duration::from_millis(0)).unwrap();
+        let first_key: ssh_key::PublicKey = PLAIN_ED25519_KEY.parse().unwrap();
+        let second_key: ssh_key::PublicKey = SECOND_ED25519_KEY.parse().unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(
+            &path,
+            format!("{PLAIN_ED25519_KEY}\n{PLAIN_ED25519_KEY}\ninvalid line without a key\n"),
+        )
+        .unwrap();
+
+        let event = store.refresh_if_due().unwrap();
+        assert!(matches!(event, Some(AuthorizedKeysReloadEvent::Failed(_))));
+        assert!(store.contains(&first_key).unwrap());
+        assert!(!store.contains(&second_key).unwrap());
+        assert_eq!(
+            store.status().last_reload_status,
+            AuthorizedKeysReloadStatus::Failed(
+                "authorized keys file contains a duplicate plain key entry".to_string()
+            )
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&path, format!("{SECOND_ED25519_KEY}\n")).unwrap();
+
+        let event = store.refresh_if_due().unwrap();
+        assert!(matches!(
+            event,
+            Some(AuthorizedKeysReloadEvent::Loaded { generation: 2, .. })
+        ));
+        assert!(!store.contains(&first_key).unwrap());
+        assert!(store.contains(&second_key).unwrap());
+    }
+
+    #[test]
+    fn delays_reload_until_debounce_interval_passes() {
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path().join("authorized_keys");
+        fs::write(&path, format!("{PLAIN_ED25519_KEY}\n")).unwrap();
+
+        let store =
+            AuthorizedKeysStore::load(path.clone(), 1024, 8, Duration::from_secs(60)).unwrap();
+        let first_key: ssh_key::PublicKey = PLAIN_ED25519_KEY.parse().unwrap();
+        let second_key: ssh_key::PublicKey = SECOND_ED25519_KEY.parse().unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&path, format!("{SECOND_ED25519_KEY}\n")).unwrap();
+
+        assert_eq!(store.refresh_if_due().unwrap(), None);
+        assert!(store.contains(&first_key).unwrap());
+        assert!(!store.contains(&second_key).unwrap());
     }
 }

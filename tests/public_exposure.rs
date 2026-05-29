@@ -182,6 +182,107 @@ async fn repeated_auth_failures_trigger_temporary_bans() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn reloads_authorized_keys_after_file_change() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let first_key = Arc::new(generate_ed25519_key()?);
+    let second_key = Arc::new(generate_ed25519_key()?);
+    let authorized_keys_path = tempdir.path().join("authorized_keys");
+    let authorized_keys = format!("{}\n", first_key.public_key().to_openssh()?);
+    let config = test_config(&tempdir, &authorized_keys, |config| {
+        config.authorized_keys_reload_interval = Duration::from_millis(30);
+        config.client_banner_timeout = Duration::from_millis(500);
+        config.login_grace_time = Duration::from_secs(1);
+    })?;
+    let (addr, task) = spawn_server(config).await?;
+
+    assert!(authenticate_with_key(addr, Arc::clone(&first_key)).await?);
+    assert!(!authenticate_with_key(addr, Arc::clone(&second_key)).await?);
+
+    sleep(Duration::from_millis(60)).await;
+    tokio::fs::write(
+        &authorized_keys_path,
+        format!("{}\n", second_key.public_key().to_openssh()?),
+    )
+    .await?;
+    sleep(Duration::from_millis(80)).await;
+
+    assert!(!authenticate_with_key(addr, Arc::clone(&first_key)).await?);
+    assert!(authenticate_with_key(addr, Arc::clone(&second_key)).await?);
+
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn keeps_last_known_good_authorized_keys_after_failed_reload() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let first_key = Arc::new(generate_ed25519_key()?);
+    let second_key = Arc::new(generate_ed25519_key()?);
+    let authorized_keys_path = tempdir.path().join("authorized_keys");
+    let authorized_keys = format!("{}\n", first_key.public_key().to_openssh()?);
+    let config = test_config(&tempdir, &authorized_keys, |config| {
+        config.authorized_keys_reload_interval = Duration::from_millis(30);
+        config.client_banner_timeout = Duration::from_millis(500);
+        config.login_grace_time = Duration::from_secs(1);
+    })?;
+    let (addr, task) = spawn_server(config).await?;
+
+    assert!(authenticate_with_key(addr, Arc::clone(&first_key)).await?);
+
+    sleep(Duration::from_millis(60)).await;
+    tokio::fs::write(
+        &authorized_keys_path,
+        format!(
+            "{}\n{}\n",
+            first_key.public_key().to_openssh()?,
+            first_key.public_key().to_openssh()?
+        ),
+    )
+    .await?;
+    sleep(Duration::from_millis(80)).await;
+
+    assert!(authenticate_with_key(addr, Arc::clone(&first_key)).await?);
+    assert!(!authenticate_with_key(addr, Arc::clone(&second_key)).await?);
+
+    sleep(Duration::from_millis(60)).await;
+    tokio::fs::write(
+        &authorized_keys_path,
+        format!("{}\n", second_key.public_key().to_openssh()?),
+    )
+    .await?;
+    sleep(Duration::from_millis(80)).await;
+
+    assert!(!authenticate_with_key(addr, Arc::clone(&first_key)).await?);
+    assert!(authenticate_with_key(addr, Arc::clone(&second_key)).await?);
+
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn uses_warm_authorized_keys_cache_without_retouching_disk_each_auth() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let first_key = Arc::new(generate_ed25519_key()?);
+    let authorized_keys_path = tempdir.path().join("authorized_keys");
+    let authorized_keys = format!("{}\n", first_key.public_key().to_openssh()?);
+    let config = test_config(&tempdir, &authorized_keys, |config| {
+        config.authorized_keys_reload_interval = Duration::from_secs(60);
+        config.client_banner_timeout = Duration::from_millis(500);
+        config.login_grace_time = Duration::from_secs(1);
+    })?;
+    let (addr, task) = spawn_server(config).await?;
+
+    assert!(authenticate_with_key(addr, Arc::clone(&first_key)).await?);
+    tokio::fs::remove_file(&authorized_keys_path).await?;
+
+    // This would fail immediately if auth re-read the file on every attempt.
+    assert!(authenticate_with_key(addr, Arc::clone(&first_key)).await?);
+
+    task.abort();
+    Ok(())
+}
+
 fn test_config(
     tempdir: &TempDir,
     authorized_keys: &str,
@@ -226,6 +327,16 @@ async fn connect_client(
 ) -> Result<client::Handle<AcceptAnyServerKey>, russh::Error> {
     let config = Arc::new(client::Config::default());
     client::connect(config, addr, AcceptAnyServerKey).await
+}
+
+async fn authenticate_with_key(addr: SocketAddr, key: Arc<PrivateKey>) -> Result<bool> {
+    let mut session = connect_client(addr).await.map_err(anyhow::Error::from)?;
+    let auth = session
+        .authenticate_publickey(&daemon_username()?, PrivateKeyWithHashAlg::new(key, None))
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    Ok(auth.success())
 }
 
 fn generate_ed25519_key() -> Result<PrivateKey> {

@@ -126,8 +126,8 @@ Attack styles mitigated:
 - [x] Enforce `authorized_keys_max_entries = 128`.
 - [x] Reject duplicate entries during cache build.
 - [x] Keep the existing fail-closed behavior for entries with OpenSSH key options.
-- [ ] Reload on explicit signal, or on file mtime change with debounce.
-- [ ] If reload fails, keep the last known-good cache instead of replacing it with a broken one.
+- [x] Reload on explicit signal, or on file mtime change with debounce.
+- [x] If reload fails, keep the last known-good cache instead of replacing it with a broken one.
 
 Suggested implementation notes:
 
@@ -285,7 +285,7 @@ These are explicitly out of scope for this roadmap:
 - [x] integration test for slow banner timeout
 - [ ] integration test for slow KEX timeout
 - [x] integration test for absolute login grace timeout
-- [ ] integration test that auth attempts do not touch disk after cache warm-up
-- [ ] integration test for cache reload success and failed-reload fallback
+- [x] integration test that auth attempts do not touch disk after cache warm-up
+- [x] integration test for cache reload success and failed-reload fallback
 - [ ] integration test for malformed auth spam not producing unbounded logs
 - [x] integration test that a crashing connection does not kill the listener

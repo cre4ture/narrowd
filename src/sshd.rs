@@ -29,7 +29,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant as TokioInstant, Sleep, timeout};
 
 use crate::admission::{AdmissionConfig, AdmissionController, AdmissionGuard};
-use crate::authorized_keys::AuthorizedKeysCache;
+use crate::authorized_keys::{
+    AuthorizedKeysReloadEvent, AuthorizedKeysReloadStatus, AuthorizedKeysStore,
+};
 use crate::config::AppConfig;
 use crate::log_limiter::{LogDecision, LogKey, LogLimiter};
 use crate::sftp::LocalSftp;
@@ -75,7 +77,7 @@ struct AppState {
     host_key: PrivateKey,
     daemon_username: String,
     home_dir: PathBuf,
-    authorized_keys: AuthorizedKeysCache,
+    authorized_keys: AuthorizedKeysStore,
     admission: AdmissionController,
     log_limiter: LogLimiter,
 }
@@ -85,24 +87,24 @@ impl AppState {
         let home_dir = dirs::home_dir().context("unable to determine home directory")?;
         let host_key = load_or_generate_host_key(&config.host_key)?;
         let daemon_username = daemon_username()?;
-        let authorized_keys = match AuthorizedKeysCache::load(
-            &config.authorized_keys_file,
-            config.authorized_keys_max_size,
-            config.authorized_keys_max_entries,
-        ) {
-            Ok(cache) => cache,
-            Err(err) if !config.authorized_keys_file.exists() => {
-                warn!(
-                    "authorized keys file {} does not exist yet; all public-key auth will be rejected until it is created",
-                    config.authorized_keys_file.display()
-                );
-                debug!(
-                    "authorized keys file {} missing: {err}",
-                    config.authorized_keys_file.display()
-                );
-                AuthorizedKeysCache::empty()
-            }
-            Err(err) => return Err(err),
+        let authorized_keys = if config.authorized_keys_file.exists() {
+            AuthorizedKeysStore::load(
+                config.authorized_keys_file.clone(),
+                config.authorized_keys_max_size,
+                config.authorized_keys_max_entries,
+                config.authorized_keys_reload_interval,
+            )?
+        } else {
+            warn!(
+                "authorized keys file {} does not exist yet; all public-key auth will be rejected until it is created",
+                config.authorized_keys_file.display()
+            );
+            AuthorizedKeysStore::empty_missing(
+                config.authorized_keys_file.clone(),
+                config.authorized_keys_max_size,
+                config.authorized_keys_max_entries,
+                config.authorized_keys_reload_interval,
+            )
         };
 
         if host_key.algorithm() != ssh_key::Algorithm::Ed25519 {
@@ -112,11 +114,23 @@ impl AppState {
             );
         }
 
-        if authorized_keys.ignored_entries() > 0 {
+        let authorized_keys_status = authorized_keys.status();
+        if matches!(
+            authorized_keys_status.last_reload_status,
+            AuthorizedKeysReloadStatus::Missing
+        ) {
+            debug!(
+                "authorized keys file {} will be polled for creation every {:?}",
+                config.authorized_keys_file.display(),
+                config.authorized_keys_reload_interval
+            );
+        }
+
+        if authorized_keys_status.ignored_entries > 0 {
             warn!(
                 "ignoring {} authorized_keys entr{} with unsupported options in {}; narrowd accepts only plain key lines",
-                authorized_keys.ignored_entries(),
-                if authorized_keys.ignored_entries() == 1 {
+                authorized_keys_status.ignored_entries,
+                if authorized_keys_status.ignored_entries == 1 {
                     "y"
                 } else {
                     "ies"
@@ -137,7 +151,56 @@ impl AppState {
     }
 
     fn is_authorized(&self, offered_key: &ssh_key::PublicKey) -> Result<bool> {
+        if let Some(event) = self.authorized_keys.refresh_if_due()? {
+            self.log_authorized_keys_reload(event);
+        }
+
         self.authorized_keys.contains(offered_key)
+    }
+
+    fn log_authorized_keys_reload(&self, event: AuthorizedKeysReloadEvent) {
+        match event {
+            AuthorizedKeysReloadEvent::Loaded {
+                generation,
+                ignored_entries,
+            } => {
+                if ignored_entries == 0 {
+                    info!(
+                        "reloaded authorized_keys from {} as generation {}",
+                        self.config.authorized_keys_file.display(),
+                        generation
+                    );
+                } else {
+                    warn!(
+                        "reloaded authorized_keys from {} as generation {}; ignored {} entr{} with unsupported options",
+                        self.config.authorized_keys_file.display(),
+                        generation,
+                        ignored_entries,
+                        if ignored_entries == 1 { "y" } else { "ies" }
+                    );
+                }
+            }
+            AuthorizedKeysReloadEvent::Missing => {
+                self.warn_limited(
+                    None,
+                    "authorized-keys-missing",
+                    format!(
+                        "authorized keys file {} disappeared; keeping the last known-good in-memory cache",
+                        self.config.authorized_keys_file.display()
+                    ),
+                );
+            }
+            AuthorizedKeysReloadEvent::Failed(message) => {
+                self.warn_limited(
+                    None,
+                    "authorized-keys-reload-failed",
+                    format!(
+                        "failed to reload authorized keys from {}; keeping the last known-good in-memory cache: {message}",
+                        self.config.authorized_keys_file.display()
+                    ),
+                );
+            }
+        }
     }
 
     fn warn_limited(&self, peer: Option<SocketAddr>, category: &'static str, message: String) {
@@ -1520,13 +1583,21 @@ mod tests {
 
         let host_key =
             PrivateKey::random(&mut UnwrapErr(getrandom::SysRng), Algorithm::Ed25519).unwrap();
+        let authorized_keys_max_size = config.authorized_keys_max_size;
+        let authorized_keys_max_entries = config.authorized_keys_max_entries;
+        let authorized_keys_reload_interval = config.authorized_keys_reload_interval;
         let state = AppState {
             admission: AdmissionController::new(AdmissionConfig::from_app_config(&config)),
             config,
             host_key,
             daemon_username: "uli".to_string(),
             home_dir: PathBuf::from("/tmp"),
-            authorized_keys: AuthorizedKeysCache::empty(),
+            authorized_keys: AuthorizedKeysStore::empty_missing(
+                PathBuf::from("/tmp/authorized_keys"),
+                authorized_keys_max_size,
+                authorized_keys_max_entries,
+                authorized_keys_reload_interval,
+            ),
             log_limiter: LogLimiter::new(Duration::from_secs(30), 64),
         };
 
