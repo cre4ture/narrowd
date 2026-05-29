@@ -55,6 +55,10 @@ Use cases where `narrowd` is not a good fit:
 - locked-down SFTP-only environments, chrooted file access, or reduced-blast-radius account separation
 - high-sensitivity or public-facing production systems where you would normally choose OpenSSH for its hardening and long operational track record
 
+For a concrete checklist of public-internet hardening work under the
+"attacker has no stolen key" threat model, see
+[`docs/public-exposure-roadmap.md`](docs/public-exposure-roadmap.md).
+
 Quick start:
 
 ```bash
