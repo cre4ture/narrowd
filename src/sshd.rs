@@ -368,10 +368,11 @@ impl<S> PreauthTimedStream<S> {
             return Some(Self::login_grace_timeout_error());
         }
 
-        if let Some(deadline) = self.kex_start_deadline {
-            if !self.kex_started && now >= deadline {
-                return Some(Self::kex_start_timeout_error());
-            }
+        if let Some(deadline) = self.kex_start_deadline
+            && !self.kex_started
+            && now >= deadline
+        {
+            return Some(Self::kex_start_timeout_error());
         }
 
         None
@@ -520,10 +521,10 @@ async fn serve_connection(
         }
     };
 
-    if ssh_config.nodelay {
-        if let Err(err) = socket.set_nodelay(true) {
-            warn!("failed to enable TCP_NODELAY for {peer_addr}: {err}");
-        }
+    if ssh_config.nodelay
+        && let Err(err) = socket.set_nodelay(true)
+    {
+        warn!("failed to enable TCP_NODELAY for {peer_addr}: {err}");
     }
 
     let accepted_at = TokioInstant::now();
@@ -1234,7 +1235,7 @@ async fn send_process_message<W>(writer: &mut W, message: &ProcessInput) -> Resu
 where
     W: AsyncWrite + Unpin,
 {
-    let payload = bincode::serialize(message).context("failed to encode process input")?;
+    let payload = serde_json::to_vec(message).context("failed to encode process input")?;
     let length = u32::try_from(payload.len()).context("process input frame too large")?;
     writer.write_u32(length).await?;
     writer.write_all(&payload).await?;
@@ -1260,7 +1261,8 @@ where
         .read_exact(&mut buffer)
         .await
         .context("failed to read process output frame body")?;
-    let message = bincode::deserialize(&buffer).context("failed to decode process output frame")?;
+    let message =
+        serde_json::from_slice(&buffer).context("failed to decode process output frame")?;
     Ok(Some(message))
 }
 
@@ -1377,32 +1379,32 @@ fn is_user_key_algorithm_allowed(algorithm: &ssh_key::Algorithm) -> bool {
 }
 
 fn public_exposure_preferred() -> russh::Preferred {
-    let mut preferred = russh::Preferred::default();
-    preferred.kex = Cow::Owned(vec![
-        russh::kex::MLKEM768X25519_SHA256,
-        russh::kex::CURVE25519,
-        russh::kex::CURVE25519_PRE_RFC_8731,
-        russh::kex::EXTENSION_SUPPORT_AS_SERVER,
-        russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER,
-    ]);
-    preferred.key = Cow::Owned(vec![
-        ssh_key::Algorithm::Ed25519,
-        ssh_key::Algorithm::SkEd25519,
-    ]);
-    preferred.cipher = Cow::Owned(vec![
-        russh::cipher::CHACHA20_POLY1305,
-        russh::cipher::AES_256_GCM,
-        russh::cipher::AES_256_CTR,
-        russh::cipher::AES_128_CTR,
-    ]);
-    preferred.mac = Cow::Owned(vec![
-        russh::mac::HMAC_SHA512_ETM,
-        russh::mac::HMAC_SHA256_ETM,
-        russh::mac::HMAC_SHA512,
-        russh::mac::HMAC_SHA256,
-    ]);
-    preferred.compression = Cow::Owned(vec![russh::compression::NONE]);
-    preferred
+    russh::Preferred {
+        kex: Cow::Owned(vec![
+            russh::kex::MLKEM768X25519_SHA256,
+            russh::kex::CURVE25519,
+            russh::kex::CURVE25519_PRE_RFC_8731,
+            russh::kex::EXTENSION_SUPPORT_AS_SERVER,
+            russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER,
+        ]),
+        key: Cow::Owned(vec![
+            ssh_key::Algorithm::Ed25519,
+            ssh_key::Algorithm::SkEd25519,
+        ]),
+        cipher: Cow::Owned(vec![
+            russh::cipher::CHACHA20_POLY1305,
+            russh::cipher::AES_256_GCM,
+            russh::cipher::AES_256_CTR,
+            russh::cipher::AES_128_CTR,
+        ]),
+        mac: Cow::Owned(vec![
+            russh::mac::HMAC_SHA512_ETM,
+            russh::mac::HMAC_SHA256_ETM,
+            russh::mac::HMAC_SHA512,
+            russh::mac::HMAC_SHA256,
+        ]),
+        compression: Cow::Owned(vec![russh::compression::NONE]),
+    }
 }
 
 fn is_env_allowed(name: &str) -> bool {

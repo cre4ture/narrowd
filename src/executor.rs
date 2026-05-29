@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
 
 use anyhow::{Context, Result, anyhow};
-use bincode::{deserialize, serialize};
 use log::{debug, warn};
 use nix::cmsg_space;
 use nix::libc;
@@ -37,6 +36,17 @@ use crate::sftp::LocalSftp;
 const CONTROL_FD: RawFd = 3;
 const MAX_CONTROL_MESSAGE_SIZE: usize = 64 * 1024;
 const MAX_SESSION_MESSAGE_SIZE: usize = 1024 * 1024;
+
+fn encode_message<T: Serialize>(message: &T, context: &'static str) -> Result<Vec<u8>> {
+    serde_json::to_vec(message).context(context)
+}
+
+fn decode_message<T>(payload: &[u8], context: &'static str) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_slice(payload).context(context)
+}
 
 #[derive(Clone)]
 pub struct ExecutorClient {
@@ -793,16 +803,18 @@ impl ControlReader {
             .cmsgs()
             .context("failed to inspect executor control ancillary data")?
         {
-            if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                if let Some(raw_fd) = fds.first().copied() {
-                    attached_fd = Some(unsafe { OwnedFd::from_raw_fd(raw_fd) });
-                }
+            if let ControlMessageOwned::ScmRights(fds) = cmsg
+                && let Some(raw_fd) = fds.first().copied()
+            {
+                attached_fd = Some(unsafe { OwnedFd::from_raw_fd(raw_fd) });
             }
         }
         let _ = message;
 
-        let decoded = deserialize(&buffer[..bytes_read])
-            .context("failed to decode executor control message")?;
+        let decoded = decode_message(
+            &buffer[..bytes_read],
+            "failed to decode executor control message",
+        )?;
 
         Ok(TransportPacket {
             message: decoded,
@@ -813,7 +825,7 @@ impl ControlReader {
 
 impl ControlWriter {
     fn send<T: Serialize>(&mut self, message: &T, attached_fd: Option<OwnedFd>) -> Result<()> {
-        let payload = serialize(message).context("failed to encode executor control message")?;
+        let payload = encode_message(message, "failed to encode executor control message")?;
         let iov = [IoSlice::new(&payload)];
 
         if let Some(fd) = attached_fd {
@@ -1217,10 +1229,10 @@ fn run_pty_control(
     while let Ok(message) = control_rx.recv() {
         match message {
             PtyControl::Write(data) => {
-                if let Some(writer) = writer.as_mut() {
-                    if writer.write_all(&data).is_err() || writer.flush().is_err() {
-                        break;
-                    }
+                if let Some(writer) = writer.as_mut()
+                    && (writer.write_all(&data).is_err() || writer.flush().is_err())
+                {
+                    break;
                 }
             }
             PtyControl::Resize(size) => {
@@ -1248,7 +1260,7 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let payload = serialize(message).context("failed to encode session message")?;
+    let payload = encode_message(message, "failed to encode session message")?;
     let length = u32::try_from(payload.len()).context("session message too large")?;
     writer.write_u32(length).await?;
     writer.write_all(&payload).await?;
@@ -1275,7 +1287,7 @@ where
         .read_exact(&mut buffer)
         .await
         .context("failed to read session message body")?;
-    let message = deserialize(&buffer).context("failed to decode session message")?;
+    let message = decode_message(&buffer, "failed to decode session message")?;
     Ok(Some(message))
 }
 

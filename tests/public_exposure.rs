@@ -715,14 +715,11 @@ async fn wait_for_binary_server(addr: SocketAddr) -> Result<()> {
             anyhow::bail!("binary server did not become ready within 5s");
         }
 
-        match TcpStream::connect(addr).await {
-            Ok(mut stream) => {
-                let banner = read_banner(&mut stream).await?;
-                if banner.starts_with(b"SSH-2.0-") {
-                    return Ok(());
-                }
+        if let Ok(mut stream) = TcpStream::connect(addr).await {
+            let banner = read_banner(&mut stream).await?;
+            if banner.starts_with(b"SSH-2.0-") {
+                return Ok(());
             }
-            Err(_) => {}
         }
 
         sleep(Duration::from_millis(50)).await;

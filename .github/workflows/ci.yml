@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint and Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build docs with warnings as errors
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+
+  test-linux:
+    name: Test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - stable
+          - beta
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run test suite
+        run: cargo test --locked --workspace --all-targets
+
+  check-macos:
+    name: Cross-check macOS build
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile all targets
+        run: cargo check --locked --workspace --all-targets
+
+  package:
+    name: Debian Package Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify packaged systemd user unit
+        run: systemd-analyze verify packaging/systemd-user/narrowd.service
+
+      - name: Build Debian package
+        run: ./scripts/build-deb.sh
+
+      - name: Inspect Debian package contents
+        run: |
+          dpkg-deb -I target/debian/*.deb
+          dpkg-deb -c target/debian/*.deb
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: narrowd-debian-package
+          path: target/debian/*.deb
+
+      - name: Install Debian package
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ./target/debian/*.deb
+
+      - name: Smoke-test installed binary
+        run: |
+          sample_config="$(mktemp)"
+          narrowd --print-sample-config > "$sample_config"
+          narrowd --check-config --config "$sample_config"
+
+      - name: Verify installed package files
+        run: |
+          test -x /usr/bin/narrowd
+          test -x /usr/lib/narrowd/narrowd-user-service
+          test -f /usr/lib/systemd/user/narrowd.service
+          test -f /usr/share/doc/narrowd/LICENSE
+          test -f /usr/share/doc/narrowd/examples/narrowd.conf.example

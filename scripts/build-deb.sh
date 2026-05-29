@@ -42,6 +42,7 @@ for tool in awk cargo dpkg-architecture dpkg-deb install; do
 done
 
 mkdir -p "$output_dir"
+rm -f "$output_dir/${package_name}"_*.deb
 rm -rf "$build_root"
 
 cargo build --release --locked
@@ -65,6 +66,8 @@ install -Dm644 "$repo_root/packaging/systemd-user/narrowd.service" \
     "$staging_dir/usr/lib/systemd/user/narrowd.service"
 install -Dm644 "$repo_root/narrowd.conf.example" \
     "$staging_dir/usr/share/doc/$package_name/examples/narrowd.conf.example"
+install -Dm644 "$repo_root/LICENSE" \
+    "$staging_dir/usr/share/doc/$package_name/LICENSE"
 install -Dm644 "$repo_root/README.md" \
     "$staging_dir/usr/share/doc/$package_name/README.md"
 

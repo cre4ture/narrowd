@@ -249,10 +249,10 @@ impl AdmissionState {
             }
         }
 
-        if let Some(peer) = self.per_peer.get_mut(&peer_ip) {
-            if peer.unauthenticated_connections > 0 {
-                peer.unauthenticated_connections -= 1;
-            }
+        if let Some(peer) = self.per_peer.get_mut(&peer_ip)
+            && peer.unauthenticated_connections > 0
+        {
+            peer.unauthenticated_connections -= 1;
         }
 
         self.cleanup_peer(peer_ip, now);
