@@ -89,7 +89,9 @@ systemctl --user enable --now narrowd.service
 The generated package is intentionally set up for a `systemd --user` service,
 not a root-owned system daemon. The packaged launcher refuses to start as
 `root`, so the SSH session, SFTP access, and port forwarding all run with the
-permissions of the target login account.
+permissions of the target login account. The packaged user service also enables
+`NoNewPrivileges=yes` and restricts address families to `AF_UNIX`, `AF_INET`,
+and `AF_INET6`.
 
 RDP over SSH tunnel:
 

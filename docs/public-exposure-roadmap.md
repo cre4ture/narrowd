@@ -210,10 +210,10 @@ Attack styles mitigated:
 - [ ] Split the daemon into at least two trust domains: a pre-auth listener/auth process and a post-auth session executor process.
 - [ ] Use a Unix socket or similar IPC to hand off "authenticated and approved" session requests.
 - [ ] Ensure the pre-auth side cannot directly spawn shells, open PTYs, or touch user session state.
-- [ ] Run the pre-auth side with `no_new_privs`.
+- [x] Run the pre-auth side with `no_new_privs`.
 - [ ] Apply seccomp or equivalent syscall filtering to the pre-auth side.
 - [ ] Make the pre-auth side filesystem access read-only except for what is strictly needed.
-- [ ] Limit address families on the pre-auth side to what it actually needs.
+- [x] Limit address families on the pre-auth side to what it actually needs.
 - [ ] Keep the post-auth side out of the network parser's direct process boundary.
 
 Suggested implementation notes:
