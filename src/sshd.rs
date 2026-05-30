@@ -1573,6 +1573,26 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn rustsec_rsa_suppression_requires_rsa_support_to_stay_disabled() {
+        let audit_config = include_str!("../.cargo/audit.toml");
+        if !audit_config.contains("RUSTSEC-2023-0071") {
+            return;
+        }
+
+        assert!(!is_user_key_algorithm_allowed(&ssh_key::Algorithm::Rsa {
+            hash: None
+        }));
+
+        let preferred = public_exposure_preferred();
+        assert!(
+            preferred
+                .key
+                .iter()
+                .all(|algorithm| !matches!(algorithm, ssh_key::Algorithm::Rsa { .. }))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn tightens_host_key_parent_directory_permissions() {

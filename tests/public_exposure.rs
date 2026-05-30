@@ -744,9 +744,17 @@ async fn wait_for_binary_server(addr: SocketAddr) -> Result<()> {
         }
 
         if let Ok(mut stream) = TcpStream::connect(addr).await {
-            let banner = read_banner(&mut stream).await?;
-            if banner.starts_with(b"SSH-2.0-") {
-                return Ok(());
+            match read_banner(&mut stream).await {
+                Ok(banner) if banner.starts_with(b"SSH-2.0-") => return Ok(()),
+                Ok(_) => {}
+                Err(err)
+                    if err
+                        .chain()
+                        .any(|cause| matches!(
+                            cause.downcast_ref::<std::io::Error>(),
+                            Some(io_err) if io_err.kind() == std::io::ErrorKind::TimedOut
+                        )) || err.to_string().contains("timed out waiting for SSH banner") => {}
+                Err(err) => return Err(err),
             }
         }
 

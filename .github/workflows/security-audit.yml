@@ -37,6 +37,9 @@ jobs:
         with:
           cache-bin: true
 
+      - name: Assert RSA stays disabled while RustSec suppression is present
+        run: cargo test --locked --lib rustsec_rsa_suppression_requires_rsa_support_to_stay_disabled
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
