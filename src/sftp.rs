@@ -8,6 +8,8 @@ use russh_sftp::server::StatusReply;
 use tokio::fs::{self, File as TokioFile, ReadDir};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
+const MAX_SFTP_READ_LEN: u32 = 1 << 20;
+
 enum HandleState {
     File { file: TokioFile },
     Dir { path: PathBuf, entries: ReadDir },
@@ -111,7 +113,8 @@ impl russh_sftp::server::Handler for LocalSftp {
         file.seek(SeekFrom::Start(offset))
             .await
             .map_err(io_error_to_status)?;
-        let mut buffer = vec![0_u8; len as usize];
+        let effective_len = len.min(MAX_SFTP_READ_LEN);
+        let mut buffer = vec![0_u8; effective_len as usize];
         let read = file.read(&mut buffer).await.map_err(io_error_to_status)?;
         if read == 0 {
             return Err(StatusCode::Eof.into());
@@ -327,5 +330,39 @@ fn io_error_to_status(error: std::io::Error) -> StatusReply {
         std::io::ErrorKind::AlreadyExists => StatusCode::Failure.with_message(error.to_string()),
         std::io::ErrorKind::UnexpectedEof => StatusCode::Eof.with_message(error.to_string()),
         _ => StatusCode::Failure.with_message(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use russh_sftp::server::Handler;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn read_caps_large_client_lengths() {
+        let tempdir = TempDir::new().unwrap();
+        let file_path = tempdir.path().join("large.bin");
+        let content_len = MAX_SFTP_READ_LEN as usize + 4096;
+        let content = vec![b'x'; content_len];
+        std::fs::write(&file_path, &content).unwrap();
+
+        let mut sftp = LocalSftp::new(tempdir.path().to_path_buf());
+        let handle = sftp
+            .open(
+                1,
+                "large.bin".to_string(),
+                OpenFlags::READ,
+                FileAttributes::default(),
+            )
+            .await
+            .unwrap()
+            .handle;
+
+        let data = sftp.read(2, handle, 0, u32::MAX).await.unwrap();
+
+        assert_eq!(data.data.len(), MAX_SFTP_READ_LEN as usize);
+        assert!(data.data.iter().all(|byte| *byte == b'x'));
     }
 }
