@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
@@ -38,7 +39,7 @@ use crate::metrics::ServerMetrics;
 use crate::sandbox;
 
 pub async fn run(config: AppConfig) -> Result<()> {
-    let state = Arc::new(AppState::bootstrap(config)?);
+    let state = Arc::new(AppState::bootstrap(config, None)?);
 
     info!(
         "starting narrowd on {}:{} with host key {}",
@@ -59,12 +60,15 @@ pub async fn run(config: AppConfig) -> Result<()> {
 ///
 /// This intentionally skips `no_new_privs`, seccomp, and Landlock setup. It is
 /// meant only for tests or embedders that need to supply their own listener and
-/// also own the responsibility for any pre-auth sandboxing they require.
+/// also own the responsibility for any pre-auth sandboxing they require. The
+/// optional `executor_program` override lets test harnesses point session
+/// execution at the real `narrowd` binary when `current_exe()` is not suitable.
 pub async fn run_on_listener_unsandboxed_for_tests(
     config: AppConfig,
     listener: TcpListener,
+    executor_program: Option<OsString>,
 ) -> Result<()> {
-    let state = Arc::new(AppState::bootstrap(config)?);
+    let state = Arc::new(AppState::bootstrap(config, executor_program)?);
     run_with_listener(state, listener).await
 }
 
@@ -115,7 +119,7 @@ struct AppState {
 }
 
 impl AppState {
-    fn bootstrap(config: AppConfig) -> Result<Self> {
+    fn bootstrap(config: AppConfig, executor_program: Option<OsString>) -> Result<Self> {
         let home_dir = dirs::home_dir().context("unable to determine home directory")?;
         let host_key = load_or_generate_host_key(&config.host_key)?;
         let daemon_username = daemon_username()?;
@@ -171,7 +175,8 @@ impl AppState {
             );
         }
 
-        let executor = ExecutorClient::spawn(config.shell.clone(), home_dir.clone())?;
+        let executor =
+            ExecutorClient::spawn(config.shell.clone(), home_dir.clone(), executor_program)?;
 
         Ok(Self {
             admission: AdmissionController::new(AdmissionConfig::from_app_config(&config)),

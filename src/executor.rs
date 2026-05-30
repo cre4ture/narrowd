@@ -295,7 +295,11 @@ pub async fn run_from_control_fd(control_fd: RawFd) -> Result<()> {
 }
 
 impl ExecutorClient {
-    pub fn spawn(shell: PathBuf, home_dir: PathBuf) -> Result<Self> {
+    pub fn spawn(
+        shell: PathBuf,
+        home_dir: PathBuf,
+        program_override: Option<OsString>,
+    ) -> Result<Self> {
         let (parent_fd, child_fd) = socketpair(
             AddressFamily::Unix,
             SockType::SeqPacket,
@@ -307,7 +311,7 @@ impl ExecutorClient {
         set_cloexec(&child_fd)?;
 
         let child_raw_fd = child_fd.as_raw_fd();
-        let mut command = StdCommand::new(executor_program()?);
+        let mut command = StdCommand::new(executor_program(program_override)?);
         command.arg("--internal-executor");
         command.arg("--control-fd");
         command.arg(CONTROL_FD.to_string());
@@ -1352,12 +1356,12 @@ fn request_id(request: &ExecutorRequest) -> Option<u64> {
     }
 }
 
-fn executor_program() -> Result<OsString> {
-    if let Some(program) = std::env::var_os("NARROWD_EXECUTOR_PROGRAM") {
+fn executor_program(program_override: Option<OsString>) -> Result<OsString> {
+    if let Some(program) = program_override {
         return Ok(program);
     }
 
-    if let Some(program) = std::env::var_os("CARGO_BIN_EXE_narrowd") {
+    if let Some(program) = std::env::var_os("NARROWD_EXECUTOR_PROGRAM") {
         return Ok(program);
     }
 
