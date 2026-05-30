@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -103,6 +104,7 @@ struct AuthorizedKeysState {
     cache: AuthorizedKeysCache,
     generation: u64,
     observed_fingerprint: AuthorizedKeysFingerprint,
+    last_failed_reload_fingerprint: Option<AuthorizedKeysFingerprint>,
     last_reload_status: AuthorizedKeysReloadStatus,
     next_reload_check_at: Instant,
 }
@@ -124,6 +126,7 @@ impl AuthorizedKeysState {
             cache,
             generation: 1,
             observed_fingerprint: fingerprint,
+            last_failed_reload_fingerprint: None,
             last_reload_status: AuthorizedKeysReloadStatus::Loaded,
             next_reload_check_at: Instant::now() + reload_interval,
         }
@@ -143,6 +146,7 @@ impl AuthorizedKeysState {
             cache: AuthorizedKeysCache::empty(),
             generation: 0,
             observed_fingerprint: AuthorizedKeysFingerprint::MISSING,
+            last_failed_reload_fingerprint: None,
             last_reload_status: AuthorizedKeysReloadStatus::Missing,
             next_reload_check_at: Instant::now() + reload_interval,
         }
@@ -158,30 +162,35 @@ impl AuthorizedKeysState {
         if current_fingerprint == self.observed_fingerprint {
             return Ok(None);
         }
-        self.observed_fingerprint = current_fingerprint;
+        if self
+            .last_failed_reload_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| *fingerprint == current_fingerprint)
+        {
+            return Ok(None);
+        }
 
         match AuthorizedKeysCache::load(&self.path, self.max_size, self.max_entries) {
             Ok((cache, fingerprint)) => {
                 self.cache = cache;
                 self.generation = self.generation.saturating_add(1);
                 self.observed_fingerprint = fingerprint;
+                self.last_failed_reload_fingerprint = None;
                 self.last_reload_status = AuthorizedKeysReloadStatus::Loaded;
                 Ok(Some(AuthorizedKeysReloadEvent::Loaded {
                     generation: self.generation,
                     ignored_entries: self.cache.ignored_entries(),
                 }))
             }
-            Err(_)
-                if matches!(
-                    self.observed_fingerprint,
-                    AuthorizedKeysFingerprint::MISSING
-                ) =>
-            {
+            Err(_) if matches!(current_fingerprint, AuthorizedKeysFingerprint::MISSING) => {
+                self.observed_fingerprint = AuthorizedKeysFingerprint::MISSING;
+                self.last_failed_reload_fingerprint = None;
                 self.last_reload_status = AuthorizedKeysReloadStatus::Missing;
                 Ok(Some(AuthorizedKeysReloadEvent::Missing))
             }
             Err(err) => {
                 let message = err.to_string();
+                self.last_failed_reload_fingerprint = Some(current_fingerprint);
                 self.last_reload_status = AuthorizedKeysReloadStatus::Failed(message.clone());
                 Ok(Some(AuthorizedKeysReloadEvent::Failed(message)))
             }
@@ -201,18 +210,24 @@ impl AuthorizedKeysCache {
         max_size: usize,
         max_entries: usize,
     ) -> Result<(Self, AuthorizedKeysFingerprint)> {
-        let text = std::fs::read_to_string(path)
+        let mut file = std::fs::File::open(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        if text.len() > max_size {
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if metadata.len() > max_size as u64 {
             bail!(
                 "authorized keys file {} exceeds configured size limit of {} bytes",
                 path.display(),
                 max_size
             );
         }
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .with_context(|| format!("failed to read {}", path.display()))?;
 
         let cache = Self::from_text(&text, max_entries)?;
-        let fingerprint = AuthorizedKeysFingerprint::from_path(path)?;
+        let fingerprint = AuthorizedKeysFingerprint::from_metadata(&metadata);
         Ok((cache, fingerprint))
     }
 
@@ -279,13 +294,17 @@ struct AuthorizedKeysFingerprint {
 }
 
 impl AuthorizedKeysFingerprint {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            modified: metadata.modified().ok(),
+            len: Some(metadata.len()),
+            missing: false,
+        }
+    }
+
     fn from_path(path: &Path) -> Result<Self> {
         match std::fs::metadata(path) {
-            Ok(metadata) => Ok(Self {
-                modified: metadata.modified().ok(),
-                len: Some(metadata.len()),
-                missing: false,
-            }),
+            Ok(metadata) => Ok(Self::from_metadata(&metadata)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::MISSING),
             Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
         }
@@ -391,6 +410,7 @@ mod tests {
                 "authorized keys file contains a duplicate plain key entry".to_string()
             )
         );
+        assert_eq!(store.refresh_if_due().unwrap(), None);
 
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&path, format!("{SECOND_ED25519_KEY}\n")).unwrap();
