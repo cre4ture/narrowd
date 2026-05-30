@@ -788,7 +788,7 @@ impl ControlReader {
         T: for<'de> Deserialize<'de>,
     {
         let mut buffer = vec![0_u8; MAX_CONTROL_MESSAGE_SIZE];
-        let mut cmsg_space = cmsg_space!([RawFd; 1]);
+        let mut cmsg_space = cmsg_space!([RawFd; 8]);
         let mut iov = [IoSliceMut::new(&mut buffer)];
         let message = recvmsg::<()>(
             self.fd.as_raw_fd(),
@@ -803,18 +803,28 @@ impl ControlReader {
         }
 
         let mut attached_fd = None;
+        let mut saw_extra_fd = false;
         let bytes_read = message.bytes;
         for cmsg in message
             .cmsgs()
             .context("failed to inspect executor control ancillary data")?
         {
-            if let ControlMessageOwned::ScmRights(fds) = cmsg
-                && let Some(raw_fd) = fds.first().copied()
-            {
-                attached_fd = Some(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+            if let ControlMessageOwned::ScmRights(fds) = cmsg {
+                for raw_fd in fds {
+                    if attached_fd.is_none() {
+                        attached_fd = Some(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                    } else {
+                        saw_extra_fd = true;
+                        drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                    }
+                }
             }
         }
         let _ = message;
+
+        if saw_extra_fd {
+            anyhow::bail!("executor control message carried more than one attached fd");
+        }
 
         let decoded = decode_message(
             &buffer[..bytes_read],
@@ -1443,4 +1453,44 @@ fn exit_status_code(status: std::process::ExitStatus) -> u32 {
         .map(|code| code as u32)
         .or_else(|| status.signal().map(|signal| 128 + signal as u32))
         .unwrap_or(255)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::File;
+
+    #[test]
+    fn rejects_control_messages_with_multiple_attached_fds() {
+        let (read_fd, write_fd) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+        let mut reader = ControlReader { fd: read_fd };
+
+        let first = File::open("/dev/null").unwrap();
+        let second = File::open("/dev/null").unwrap();
+        let payload = encode_message(
+            &ExecutorRequest::Hello(ExecutorHello {
+                home_dir: PathBuf::from("/tmp"),
+                shell: PathBuf::from("/bin/bash"),
+            }),
+            "failed to encode executor control message",
+        )
+        .unwrap();
+        let iov = [IoSlice::new(&payload)];
+        let rights = [first.as_raw_fd(), second.as_raw_fd()];
+        let cmsgs = [ControlMessage::ScmRights(&rights)];
+
+        sendmsg::<()>(write_fd.as_raw_fd(), &iov, &cmsgs, MsgFlags::empty(), None).unwrap();
+
+        match reader.recv::<ExecutorRequest>() {
+            Ok(_) => panic!("control message with multiple attached fds unexpectedly succeeded"),
+            Err(err) => assert!(err.to_string().contains("more than one attached fd")),
+        }
+    }
 }
