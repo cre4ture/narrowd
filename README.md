@@ -2,8 +2,8 @@
 
 `narrowd` is a small, single-user Rust SSH daemon built around `russh`.
 
-It is designed as a lightweight remote-access daemon for one Unix account, NOT
-as a drop-in replacement for a hardened multi-user `sshd`.
+It is designed as a `ssh`- and `scp`-compatible lightweight remote-access daemon for one Unix account.
+But its explicitly NOT a full drop-in replacement for a hardened multi-user `sshd`.
 
 License: MIT. See [`LICENSE`](LICENSE).
 
