@@ -54,7 +54,16 @@ pub async fn run(config: AppConfig) -> Result<()> {
     run_with_listener(state, listener).await
 }
 
-pub async fn run_on_listener(config: AppConfig, listener: TcpListener) -> Result<()> {
+/// Runs the SSH server on an already-bound listener without applying the normal
+/// pre-auth hardening layer.
+///
+/// This intentionally skips `no_new_privs`, seccomp, and Landlock setup. It is
+/// meant only for tests or embedders that need to supply their own listener and
+/// also own the responsibility for any pre-auth sandboxing they require.
+pub async fn run_on_listener_unsandboxed_for_tests(
+    config: AppConfig,
+    listener: TcpListener,
+) -> Result<()> {
     let state = Arc::new(AppState::bootstrap(config)?);
     run_with_listener(state, listener).await
 }

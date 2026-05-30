@@ -574,7 +574,10 @@ fn test_config(
 async fn spawn_server(config: AppConfig) -> Result<(SocketAddr, JoinHandle<Result<()>>)> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
-    let task = tokio::spawn(async move { sshd::run_on_listener(config, listener).await });
+    let task =
+        tokio::spawn(
+            async move { sshd::run_on_listener_unsandboxed_for_tests(config, listener).await },
+        );
 
     sleep(Duration::from_millis(50)).await;
     Ok((addr, task))
