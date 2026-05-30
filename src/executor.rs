@@ -1437,7 +1437,8 @@ pub fn map_signal(signal: &Sig) -> Option<ExecutorSignal> {
 }
 
 fn send_signal_to_pid(pid: u32, signal: Signal) -> Result<()> {
-    kill(Pid::from_raw(pid as i32), signal).context("failed to signal child")
+    let pid = i32::try_from(pid).context("child pid too large")?;
+    kill(Pid::from_raw(pid), signal).context("failed to signal child")
 }
 
 fn send_signal_to_process_group(group: i32, signal: Signal) -> Result<()> {
@@ -1492,5 +1493,11 @@ mod tests {
             Ok(_) => panic!("control message with multiple attached fds unexpectedly succeeded"),
             Err(err) => assert!(err.to_string().contains("more than one attached fd")),
         }
+    }
+
+    #[test]
+    fn rejects_child_pids_that_do_not_fit_i32() {
+        let err = send_signal_to_pid(i32::MAX as u32 + 1, Signal::SIGTERM).unwrap_err();
+        assert!(err.to_string().contains("child pid too large"));
     }
 }
