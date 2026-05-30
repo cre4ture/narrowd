@@ -23,8 +23,8 @@ Explicit NON-Goals:
 
 - multi-user account/session management (instead, use `su` to change user in terminal when logged in)
 - support of any legacy or outdated functionality (use modern alternatives instead)
-    - legacy SCP protocol (modern `scp` tool uses sftp already by default)
-- X11 forwarding (use waypipe and TCP tunnel instead)
+  - legacy SCP protocol (modern `scp` tool uses sftp already by default)
+  - X11 forwarding (use waypipe and TCP tunnel instead)
 
 Security model / exposure guidance:
 
