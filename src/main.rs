@@ -33,6 +33,10 @@ struct Cli {
     /// Internal pre-auth sandbox probe mode.
     #[arg(long, hide = true)]
     internal_preauth_sandbox_probe: Option<PathBuf>,
+
+    /// Internal probe for the pre-auth sandbox default-deny seccomp policy.
+    #[arg(long, hide = true)]
+    internal_preauth_default_deny_probe: Option<PathBuf>,
 }
 
 fn init_logging(level: config::LogLevel) {
@@ -60,6 +64,10 @@ async fn main() -> Result<()> {
     if let Some(probe_path) = cli.internal_preauth_sandbox_probe {
         print!("{}", sandbox::internal_preauth_probe(&probe_path)?);
         return Ok(());
+    }
+
+    if let Some(probe_path) = cli.internal_preauth_default_deny_probe {
+        return sandbox::internal_preauth_default_deny_probe(&probe_path);
     }
 
     if cli.print_sample_config {

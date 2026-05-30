@@ -4,6 +4,7 @@ use anyhow::Result;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::ffi::CString;
     use std::fs::{self, OpenOptions};
     use std::mem::size_of;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -61,6 +62,10 @@ mod linux {
 
     const LANDLOCK_ALLOWED_READ_ACCESS: u64 =
         LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+
+    const SECCOMP_ACTION_ALLOW: u32 = libc::SECCOMP_RET_ALLOW;
+    const SECCOMP_ACTION_KILL_PROCESS: u32 = libc::SECCOMP_RET_KILL_PROCESS;
+    const SECCOMP_ACTION_ERRNO: u32 = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32);
 
     #[cfg(target_arch = "x86_64")]
     const AUDIT_ARCH_NATIVE: u32 = 0xC000_003E;
@@ -121,6 +126,16 @@ mod linux {
             u8::from(exec_denied),
             seccomp_mode
         ))
+    }
+
+    pub fn internal_default_deny_probe(authorized_keys_file: &Path) -> Result<()> {
+        enable_no_new_privs()?;
+        apply_preauth_sandbox(authorized_keys_file)?;
+
+        let name = CString::new("narrowd-seccomp-default-deny-probe")
+            .expect("probe CString should not contain interior NUL bytes");
+        let _ = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0) };
+        Ok(())
     }
 
     fn install_authorized_keys_landlock(authorized_keys_file: &Path) -> Result<PathBuf> {
@@ -192,55 +207,7 @@ mod linux {
     }
 
     fn install_preauth_seccomp_filter() -> Result<()> {
-        let denied = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32);
-        let mut instructions = vec![
-            unsafe {
-                libc::BPF_STMT(
-                    (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
-                    std::mem::offset_of!(libc::seccomp_data, arch) as u32,
-                )
-            },
-            unsafe {
-                libc::BPF_JUMP(
-                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-                    AUDIT_ARCH_NATIVE,
-                    1,
-                    0,
-                )
-            },
-            unsafe {
-                libc::BPF_STMT(
-                    (libc::BPF_RET | libc::BPF_K) as u16,
-                    libc::SECCOMP_RET_KILL_PROCESS,
-                )
-            },
-            unsafe {
-                libc::BPF_STMT(
-                    (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
-                    std::mem::offset_of!(libc::seccomp_data, nr) as u32,
-                )
-            },
-        ];
-
-        for syscall_nr in blocked_syscalls() {
-            instructions.push(unsafe {
-                libc::BPF_JUMP(
-                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-                    *syscall_nr as u32,
-                    0,
-                    1,
-                )
-            });
-            instructions
-                .push(unsafe { libc::BPF_STMT((libc::BPF_RET | libc::BPF_K) as u16, denied) });
-        }
-
-        instructions.push(unsafe {
-            libc::BPF_STMT(
-                (libc::BPF_RET | libc::BPF_K) as u16,
-                libc::SECCOMP_RET_ALLOW,
-            )
-        });
+        let mut instructions = build_preauth_seccomp_instructions();
 
         let mut program = libc::sock_fprog {
             len: instructions.len() as u16,
@@ -264,7 +231,66 @@ mod linux {
         }
     }
 
-    fn blocked_syscalls() -> &'static [libc::c_long] {
+    fn build_preauth_seccomp_instructions() -> Vec<libc::sock_filter> {
+        let mut instructions = vec![
+            bpf_stmt(
+                libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+                std::mem::offset_of!(libc::seccomp_data, arch) as u32,
+            ),
+            bpf_jump(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                AUDIT_ARCH_NATIVE,
+                1,
+                0,
+            ),
+            bpf_ret(SECCOMP_ACTION_KILL_PROCESS),
+            bpf_stmt(
+                libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+                std::mem::offset_of!(libc::seccomp_data, nr) as u32,
+            ),
+        ];
+
+        // Return EPERM for operations we intentionally want callers to see as
+        // rejected, rather than killing the whole parser process.
+        append_syscall_rules(&mut instructions, errno_syscalls(), SECCOMP_ACTION_ERRNO);
+
+        // Everything else must be explicitly allowed. Any syscall that falls
+        // through this table kills the process.
+        append_syscall_rules(&mut instructions, allowed_syscalls(), SECCOMP_ACTION_ALLOW);
+
+        instructions.push(bpf_ret(SECCOMP_ACTION_KILL_PROCESS));
+        instructions
+    }
+
+    fn append_syscall_rules(
+        instructions: &mut Vec<libc::sock_filter>,
+        syscall_numbers: &[libc::c_long],
+        action: u32,
+    ) {
+        for &syscall_nr in syscall_numbers {
+            instructions.push(bpf_jump(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                syscall_nr as u32,
+                0,
+                1,
+            ));
+            instructions.push(bpf_ret(action));
+        }
+    }
+
+    fn bpf_stmt(code: libc::c_uint, k: u32) -> libc::sock_filter {
+        unsafe { libc::BPF_STMT(code as u16, k) }
+    }
+
+    fn bpf_jump(code: libc::c_uint, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+        unsafe { libc::BPF_JUMP(code as u16, k, jt, jf) }
+    }
+
+    fn bpf_ret(action: u32) -> libc::sock_filter {
+        bpf_stmt(libc::BPF_RET | libc::BPF_K, action)
+    }
+
+    fn errno_syscalls() -> &'static [libc::c_long] {
         &[
             libc::SYS_execve,
             libc::SYS_execveat,
@@ -296,6 +322,54 @@ mod linux {
             libc::SYS_open_by_handle_at,
             libc::SYS_setns,
             libc::SYS_unshare,
+        ]
+    }
+
+    fn allowed_syscalls() -> &'static [libc::c_long] {
+        &[
+            libc::SYS_accept,
+            libc::SYS_accept4,
+            libc::SYS_brk,
+            libc::SYS_clock_gettime,
+            libc::SYS_close,
+            libc::SYS_epoll_ctl,
+            libc::SYS_epoll_pwait,
+            libc::SYS_epoll_pwait2,
+            libc::SYS_epoll_wait,
+            libc::SYS_exit,
+            libc::SYS_exit_group,
+            libc::SYS_fcntl,
+            libc::SYS_futex,
+            libc::SYS_getrandom,
+            libc::SYS_getsockopt,
+            libc::SYS_ioctl,
+            libc::SYS_lseek,
+            libc::SYS_madvise,
+            libc::SYS_mlock,
+            libc::SYS_mmap,
+            libc::SYS_mprotect,
+            libc::SYS_mremap,
+            libc::SYS_munlock,
+            libc::SYS_munmap,
+            libc::SYS_newfstatat,
+            libc::SYS_openat,
+            libc::SYS_prctl,
+            libc::SYS_read,
+            libc::SYS_readv,
+            libc::SYS_recvfrom,
+            libc::SYS_recvmsg,
+            libc::SYS_rt_sigaction,
+            libc::SYS_rt_sigprocmask,
+            libc::SYS_rt_sigreturn,
+            libc::SYS_sendmsg,
+            libc::SYS_sendto,
+            libc::SYS_setsockopt,
+            libc::SYS_shutdown,
+            libc::SYS_sigaltstack,
+            libc::SYS_socketpair,
+            libc::SYS_statx,
+            libc::SYS_write,
+            libc::SYS_writev,
         ]
     }
 
@@ -371,6 +445,32 @@ mod linux {
             Err(std::io::Error::last_os_error().into())
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn preauth_seccomp_filter_is_default_deny() {
+            let instructions = build_preauth_seccomp_instructions();
+            assert_eq!(
+                instructions.last().map(|instruction| instruction.k),
+                Some(SECCOMP_ACTION_KILL_PROCESS)
+            );
+        }
+
+        #[test]
+        fn preauth_seccomp_filter_keeps_dangerous_syscalls_out_of_allowlist() {
+            assert!(!allowed_syscalls().contains(&libc::SYS_socket));
+            assert!(!allowed_syscalls().contains(&libc::SYS_connect));
+            assert!(!allowed_syscalls().contains(&libc::SYS_clone3));
+            assert!(!allowed_syscalls().contains(&libc::SYS_execve));
+            assert!(errno_syscalls().contains(&libc::SYS_socket));
+            assert!(errno_syscalls().contains(&libc::SYS_connect));
+            assert!(errno_syscalls().contains(&libc::SYS_clone3));
+            assert!(errno_syscalls().contains(&libc::SYS_execve));
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -401,4 +501,14 @@ pub fn internal_preauth_probe(authorized_keys_file: &Path) -> Result<String> {
 #[cfg(not(target_os = "linux"))]
 pub fn internal_preauth_probe(_authorized_keys_file: &Path) -> Result<String> {
     Ok("read_ok=1\nwrite_denied=0\nexec_denied=0\nseccomp_mode=0\n".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub fn internal_preauth_default_deny_probe(authorized_keys_file: &Path) -> Result<()> {
+    linux::internal_default_deny_probe(authorized_keys_file)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn internal_preauth_default_deny_probe(_authorized_keys_file: &Path) -> Result<()> {
+    Ok(())
 }

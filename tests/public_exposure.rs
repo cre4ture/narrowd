@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::Arc;
 use std::sync::{Mutex, Once, OnceLock};
@@ -246,6 +247,30 @@ fn internal_preauth_sandbox_probe_blocks_writes_and_exec() -> Result<()> {
     assert_eq!(parse_probe_flag(&stdout, "write_denied"), Some(1));
     assert_eq!(parse_probe_flag(&stdout, "exec_denied"), Some(1));
     assert_eq!(parse_probe_flag(&stdout, "seccomp_mode"), Some(2));
+    Ok(())
+}
+
+#[test]
+fn internal_preauth_sandbox_kills_unallowed_syscalls() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let probe_path = tempdir.path().join("authorized_keys");
+    std::fs::write(&probe_path, "probe-key\n")
+        .with_context(|| format!("failed to write {}", probe_path.display()))?;
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_narrowd"))
+        .arg("--internal-preauth-default-deny-probe")
+        .arg(&probe_path)
+        .output()
+        .context("failed to run default-deny seccomp probe")?;
+
+    assert!(
+        !output.status.success(),
+        "default-deny probe unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), None);
+    assert_eq!(output.status.signal(), Some(nix::libc::SIGSYS));
     Ok(())
 }
 
