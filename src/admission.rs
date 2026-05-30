@@ -178,15 +178,31 @@ impl AdmissionState {
         now: Instant,
     ) -> Result<(), RejectReason> {
         self.cleanup_peer(peer_ip, now);
+        let peer = self.per_peer.get(&peer_ip);
+
+        if peer.is_some_and(|peer| peer.is_banned(now)) {
+            return Err(RejectReason::TemporarilyBanned);
+        }
+
+        if self.unauthenticated_connections >= self.config.max_unauth_connections_global {
+            return Err(RejectReason::TooManyUnauthenticatedConnections);
+        }
+
+        if peer.is_some_and(|peer| {
+            peer.unauthenticated_connections >= self.config.max_unauth_connections_per_ip
+        }) {
+            return Err(RejectReason::TooManyUnauthenticatedConnectionsForIp);
+        }
+
+        let subnet_connections = self.per_subnet.get(&subnet).copied().unwrap_or_default();
+        if subnet_connections >= self.config.max_unauth_connections_per_subnet {
+            return Err(RejectReason::TooManyUnauthenticatedConnectionsForSubnet);
+        }
 
         let peer = self
             .per_peer
             .entry(peer_ip)
             .or_insert_with(|| PeerState::new(self.config.new_connections_burst_per_ip, now));
-
-        if peer.is_banned(now) {
-            return Err(RejectReason::TemporarilyBanned);
-        }
 
         if !peer.connection_bucket.try_consume(
             self.config.new_connections_per_minute_per_ip,
@@ -194,19 +210,6 @@ impl AdmissionState {
             now,
         ) {
             return Err(RejectReason::ConnectionRateLimited);
-        }
-
-        if self.unauthenticated_connections >= self.config.max_unauth_connections_global {
-            return Err(RejectReason::TooManyUnauthenticatedConnections);
-        }
-
-        if peer.unauthenticated_connections >= self.config.max_unauth_connections_per_ip {
-            return Err(RejectReason::TooManyUnauthenticatedConnectionsForIp);
-        }
-
-        let subnet_connections = self.per_subnet.get(&subnet).copied().unwrap_or_default();
-        if subnet_connections >= self.config.max_unauth_connections_per_subnet {
-            return Err(RejectReason::TooManyUnauthenticatedConnectionsForSubnet);
         }
 
         self.unauthenticated_connections += 1;
@@ -416,7 +419,12 @@ mod tests {
 
     #[test]
     fn enforces_rate_limit_and_refills_over_time() {
-        let controller = AdmissionController::new(test_config());
+        let mut config = test_config();
+        config.max_unauth_connections_global = 8;
+        config.max_unauth_connections_per_ip = 8;
+        config.max_unauth_connections_per_subnet = 8;
+
+        let controller = AdmissionController::new(config);
         let now = Instant::now();
         let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
 
@@ -480,5 +488,44 @@ mod tests {
             reject,
             RejectReason::TooManyUnauthenticatedConnectionsForSubnet
         );
+    }
+
+    #[test]
+    fn cap_rejections_do_not_consume_rate_limit_tokens() {
+        let mut config = test_config();
+        config.max_unauth_connections_global = 1;
+        config.max_unauth_connections_per_ip = 4;
+        config.max_unauth_connections_per_subnet = 4;
+        config.new_connections_burst_per_ip = 1;
+        config.new_connections_per_minute_per_ip = 60;
+
+        let controller = AdmissionController::new(config);
+        let now = Instant::now();
+        let holding_peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let blocked_peer = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+
+        let guard = controller.try_acquire_at(holding_peer, now).unwrap();
+
+        let first_reject = controller
+            .try_acquire_at(blocked_peer, now + Duration::from_millis(1))
+            .unwrap_err();
+        assert_eq!(
+            first_reject,
+            RejectReason::TooManyUnauthenticatedConnections
+        );
+
+        let second_reject = controller
+            .try_acquire_at(blocked_peer, now + Duration::from_millis(2))
+            .unwrap_err();
+        assert_eq!(
+            second_reject,
+            RejectReason::TooManyUnauthenticatedConnections
+        );
+
+        drop(guard);
+
+        controller
+            .try_acquire_at(blocked_peer, now + Duration::from_millis(3))
+            .unwrap();
     }
 }
