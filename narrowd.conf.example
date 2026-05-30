@@ -1,4 +1,5 @@
 # narrowd sample config
+# single-user SSH daemon
 Port 2222
 ListenAddress 0.0.0.0
 
@@ -13,5 +14,31 @@ Subsystem sftp internal-sftp
 AllowTcpForwarding yes
 AllowRemoteForwarding yes
 GatewayPorts yes
+
+# Public exposure hardening defaults
+MaxUnauthConnectionsGlobal 16
+MaxUnauthConnectionsPerIp 3
+MaxUnauthConnectionsPerSubnet 8
+NewConnectionsPerMinutePerIp 12
+NewConnectionsBurstPerIp 4
+LoginGraceTime 15s
+ClientBannerTimeout 5s
+KexStartTimeout 5s
+MaxAuthAttempts 4
+AuthRejectionTime 2s
+AuthFailureBanThreshold 8
+AuthFailureBanWindow 10m
+AuthFailureBanDuration 15m
+InactivityTimeout 15m
+KeepaliveInterval 30s
+KeepaliveMax 3
+ChannelBufferSize 32
+EventBufferSize 16
+WindowSize 1048576
+MaximumPacketSize 32768
+NoDelay yes
+AuthorizedKeysMaxSize 256KiB
+AuthorizedKeysMaxEntries 128
+AuthorizedKeysReloadInterval 2s
 
 LogLevel info

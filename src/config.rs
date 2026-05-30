@@ -581,4 +581,10 @@ mod tests {
         assert_eq!(parse_byte_size("64KiB").unwrap(), 64 * 1024);
         assert_eq!(parse_byte_size("1MiB").unwrap(), 1024 * 1024);
     }
+
+    #[test]
+    fn packaged_example_matches_sample_config() {
+        let packaged_example = include_str!("../narrowd.conf.example");
+        assert_eq!(packaged_example, SAMPLE_CONFIG);
+    }
 }
