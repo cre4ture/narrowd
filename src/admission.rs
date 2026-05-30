@@ -286,10 +286,7 @@ impl AdmissionState {
             return;
         };
 
-        peer.refresh_transient_state(
-            now,
-            self.config.auth_failure_ban_window,
-        );
+        peer.refresh_transient_state(now, self.config.auth_failure_ban_window);
 
         if peer.can_be_removed() {
             self.per_peer.remove(&peer_ip);
@@ -319,11 +316,7 @@ impl PeerState {
         self.banned_until.is_some_and(|until| until > now)
     }
 
-    fn refresh_transient_state(
-        &mut self,
-        now: Instant,
-        auth_failure_ban_window: Duration,
-    ) {
+    fn refresh_transient_state(&mut self, now: Instant, auth_failure_ban_window: Duration) {
         if self.banned_until.is_some_and(|until| until <= now) {
             self.banned_until = None;
         }
