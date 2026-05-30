@@ -1361,10 +1361,6 @@ fn executor_program(program_override: Option<OsString>) -> Result<OsString> {
         return Ok(program);
     }
 
-    if let Some(program) = std::env::var_os("NARROWD_EXECUTOR_PROGRAM") {
-        return Ok(program);
-    }
-
     std::env::current_exe()
         .map(|path| path.into_os_string())
         .context("failed to resolve current executable for executor spawn")

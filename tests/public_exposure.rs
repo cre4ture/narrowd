@@ -882,7 +882,6 @@ impl SpawnedBinaryServer {
             .arg("--config")
             .arg(config_path)
             .env_remove("RUST_LOG")
-            .env("NARROWD_EXECUTOR_PROGRAM", env!("CARGO_BIN_EXE_narrowd"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
