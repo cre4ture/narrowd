@@ -1295,6 +1295,8 @@ fn load_or_generate_host_key(path: &PathBuf) -> Result<PrivateKey> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
+        ensure_private_host_key_directory(parent)
+            .with_context(|| format!("failed to secure {}", parent.display()))?;
     }
 
     let mut rng = UnwrapErr(getrandom::SysRng);
@@ -1304,6 +1306,19 @@ fn load_or_generate_host_key(path: &PathBuf) -> Result<PrivateKey> {
         .with_context(|| format!("failed to write host key {}", path.display()))?;
     info!("generated new host key at {}", path.display());
     Ok(key)
+}
+
+#[cfg(unix)]
+fn ensure_private_host_key_directory(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to set directory mode 0700 on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn ensure_private_host_key_directory(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }
 
 fn build_ssh_config(state: &AppState) -> server::Config {
@@ -1506,6 +1521,10 @@ fn clamp_dimension(value: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use tempfile::TempDir;
 
     #[test]
     fn rejects_non_matching_login_usernames() {
@@ -1523,6 +1542,21 @@ mod tests {
         assert!(!is_user_key_algorithm_allowed(&ssh_key::Algorithm::Rsa {
             hash: None
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tightens_host_key_parent_directory_permissions() {
+        let tempdir = TempDir::new().unwrap();
+        let parent = tempdir.path().join("config");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let host_key_path = parent.join("ssh_host_ed25519_key");
+        load_or_generate_host_key(&host_key_path).unwrap();
+
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]
