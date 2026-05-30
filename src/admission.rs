@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
 
+const PEER_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Debug)]
 pub struct AdmissionConfig {
     pub max_unauth_connections_global: usize,
@@ -159,6 +161,7 @@ struct AdmissionState {
     unauthenticated_connections: usize,
     per_subnet: HashMap<SubnetKey, usize>,
     per_peer: HashMap<IpAddr, PeerState>,
+    last_peer_sweep: Instant,
 }
 
 impl AdmissionState {
@@ -168,6 +171,7 @@ impl AdmissionState {
             unauthenticated_connections: 0,
             per_subnet: HashMap::new(),
             per_peer: HashMap::new(),
+            last_peer_sweep: Instant::now(),
         }
     }
 
@@ -177,6 +181,7 @@ impl AdmissionState {
         subnet: SubnetKey,
         now: Instant,
     ) -> Result<(), RejectReason> {
+        self.maybe_cleanup_peers(now);
         self.cleanup_peer(peer_ip, now);
         let peer = self.per_peer.get(&peer_ip);
 
@@ -219,6 +224,7 @@ impl AdmissionState {
     }
 
     fn record_auth_failure(&mut self, peer_ip: IpAddr, now: Instant) -> bool {
+        self.maybe_cleanup_peers(now);
         self.cleanup_peer(peer_ip, now);
         let peer = self
             .per_peer
@@ -240,6 +246,7 @@ impl AdmissionState {
     }
 
     fn release(&mut self, peer_ip: IpAddr, subnet: SubnetKey, now: Instant) {
+        self.maybe_cleanup_peers(now);
         if self.unauthenticated_connections > 0 {
             self.unauthenticated_connections -= 1;
         }
@@ -261,23 +268,30 @@ impl AdmissionState {
         self.cleanup_peer(peer_ip, now);
     }
 
+    fn maybe_cleanup_peers(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_peer_sweep) < PEER_SWEEP_INTERVAL {
+            return;
+        }
+
+        let auth_failure_ban_window = self.config.auth_failure_ban_window;
+        self.per_peer.retain(|_, peer| {
+            peer.refresh_transient_state(now, auth_failure_ban_window);
+            !peer.can_be_removed()
+        });
+        self.last_peer_sweep = now;
+    }
+
     fn cleanup_peer(&mut self, peer_ip: IpAddr, now: Instant) {
         let Some(peer) = self.per_peer.get_mut(&peer_ip) else {
             return;
         };
 
-        if peer.banned_until.is_some_and(|until| until <= now) {
-            peer.banned_until = None;
-        }
-        prune_before(
-            &mut peer.auth_failures,
-            now - self.config.auth_failure_ban_window,
+        peer.refresh_transient_state(
+            now,
+            self.config.auth_failure_ban_window,
         );
 
-        if peer.unauthenticated_connections == 0
-            && peer.banned_until.is_none()
-            && peer.auth_failures.is_empty()
-        {
+        if peer.can_be_removed() {
             self.per_peer.remove(&peer_ip);
         }
     }
@@ -304,6 +318,23 @@ impl PeerState {
     fn is_banned(&self, now: Instant) -> bool {
         self.banned_until.is_some_and(|until| until > now)
     }
+
+    fn refresh_transient_state(
+        &mut self,
+        now: Instant,
+        auth_failure_ban_window: Duration,
+    ) {
+        if self.banned_until.is_some_and(|until| until <= now) {
+            self.banned_until = None;
+        }
+        prune_before(&mut self.auth_failures, now - auth_failure_ban_window);
+    }
+
+    fn can_be_removed(&self) -> bool {
+        self.unauthenticated_connections == 0
+            && self.banned_until.is_none()
+            && self.auth_failures.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -321,12 +352,7 @@ impl TokenBucket {
     }
 
     fn try_consume(&mut self, limit_per_minute: usize, burst_limit: usize, now: Instant) -> bool {
-        let refill_rate_per_second = limit_per_minute as f64 / 60.0;
-        let elapsed = now
-            .saturating_duration_since(self.last_refill)
-            .as_secs_f64();
-        self.tokens = (self.tokens + elapsed * refill_rate_per_second).min(burst_limit as f64);
-        self.last_refill = now;
+        self.refill(limit_per_minute, burst_limit, now);
 
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
@@ -334,6 +360,15 @@ impl TokenBucket {
         } else {
             false
         }
+    }
+
+    fn refill(&mut self, limit_per_minute: usize, burst_limit: usize, now: Instant) {
+        let refill_rate_per_second = limit_per_minute as f64 / 60.0;
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * refill_rate_per_second).min(burst_limit as f64);
+        self.last_refill = now;
     }
 }
 
@@ -527,5 +562,30 @@ mod tests {
         controller
             .try_acquire_at(blocked_peer, now + Duration::from_millis(3))
             .unwrap();
+    }
+
+    #[test]
+    fn sweeps_stale_auth_failure_entries_during_later_traffic() {
+        let controller = AdmissionController::new(test_config());
+        let now = Instant::now();
+        let stale_peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let trigger_peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+
+        assert!(!controller.record_auth_failure_at(stale_peer, now));
+
+        {
+            let state = controller.inner.lock().unwrap();
+            assert!(state.per_peer.contains_key(&stale_peer));
+        }
+
+        let _guard = controller
+            .try_acquire_at(
+                trigger_peer,
+                now + PEER_SWEEP_INTERVAL + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        let state = controller.inner.lock().unwrap();
+        assert!(!state.per_peer.contains_key(&stale_peer));
     }
 }
