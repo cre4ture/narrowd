@@ -1288,8 +1288,10 @@ where
 
 fn load_or_generate_host_key(path: &PathBuf) -> Result<PrivateKey> {
     if path.exists() {
-        return PrivateKey::read_openssh_file(path)
-            .with_context(|| format!("failed to read host key {}", path.display()));
+        let key = PrivateKey::read_openssh_file(path)
+            .with_context(|| format!("failed to read host key {}", path.display()))?;
+        verify_private_host_key_file_permissions(path)?;
+        return Ok(key);
     }
 
     if let Some(parent) = path.parent() {
@@ -1304,8 +1306,35 @@ fn load_or_generate_host_key(path: &PathBuf) -> Result<PrivateKey> {
         PrivateKey::random(&mut rng, Algorithm::Ed25519).context("failed to generate host key")?;
     key.write_openssh_file(path, ssh_key::LineEnding::LF)
         .with_context(|| format!("failed to write host key {}", path.display()))?;
+    verify_private_host_key_file_permissions(path)?;
     info!("generated new host key at {}", path.display());
     Ok(key)
+}
+
+#[cfg(unix)]
+fn verify_private_host_key_file_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat host key {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "host key {} has insecure permissions {:03o}; group/other access bits must be unset",
+            path.display(),
+            mode
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_host_key_file_permissions(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1557,6 +1586,22 @@ mod tests {
 
         let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_host_keys_with_group_or_other_permissions() {
+        let tempdir = TempDir::new().unwrap();
+        let host_key_path = tempdir.path().join("ssh_host_ed25519_key");
+
+        PrivateKey::random(&mut UnwrapErr(getrandom::SysRng), Algorithm::Ed25519)
+            .unwrap()
+            .write_openssh_file(&host_key_path, ssh_key::LineEnding::LF)
+            .unwrap();
+        std::fs::set_permissions(&host_key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = load_or_generate_host_key(&host_key_path).unwrap_err();
+        assert!(err.to_string().contains("insecure permissions"));
     }
 
     #[test]
