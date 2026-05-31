@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use getrandom::rand_core::UnwrapErr;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use narrowd::config::AppConfig;
@@ -195,13 +195,9 @@ async fn main_binary_sets_no_new_privs_only_on_the_preauth_process() -> Result<(
     let tempdir = TempDir::new()?;
     let client_key = Arc::new(generate_ed25519_key()?);
     let authorized_keys = format!("{}\n", client_key.public_key().to_openssh()?);
-    let port = unused_local_port()?;
     let (host_key, authorized_keys_path) = write_binary_server_keys(&tempdir, &authorized_keys)?;
-    let config_path = write_binary_server_config(&tempdir, port, &host_key, &authorized_keys_path)?;
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let mut server = SpawnedBinaryServer::start(&config_path, addr)?;
-
-    wait_for_binary_server(addr).await?;
+    let (mut server, addr) =
+        spawn_ready_binary_server(&tempdir, &host_key, &authorized_keys_path).await?;
 
     let server_status = std::fs::read_to_string(format!("/proc/{}/status", server.pid()))
         .context("failed to read server /proc status")?;
@@ -736,30 +732,81 @@ LogLevel debug
     Ok(config_path)
 }
 
-async fn wait_for_binary_server(addr: SocketAddr) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+async fn spawn_ready_binary_server(
+    tempdir: &TempDir,
+    host_key: &std::path::Path,
+    authorized_keys_path: &std::path::Path,
+) -> Result<(SpawnedBinaryServer, SocketAddr)> {
+    let mut last_err = None;
+
+    for attempt in 1..=5 {
+        let port = unused_local_port()?;
+        let config_path =
+            write_binary_server_config(tempdir, port, host_key, authorized_keys_path)?;
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut server = SpawnedBinaryServer::start(&config_path, addr)?;
+
+        match wait_for_binary_server_with_process(&mut server, addr).await {
+            Ok(()) => return Ok((server, addr)),
+            Err(err) => {
+                last_err = Some(err.context(format!(
+                    "binary server startup attempt {attempt} on {addr} failed"
+                )));
+                let _ = server.stop();
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("binary server failed to start")))
+}
+
+async fn wait_for_binary_server_with_process(
+    server: &mut SpawnedBinaryServer,
+    addr: SocketAddr,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
+        if let Some(status) = server.try_wait()? {
+            anyhow::bail!("binary server exited during startup with status {status}");
+        }
+
         if Instant::now() >= deadline {
-            anyhow::bail!("binary server did not become ready within 5s");
+            anyhow::bail!("binary server did not become ready within 10s");
         }
 
         if let Ok(mut stream) = TcpStream::connect(addr).await {
             match read_banner(&mut stream).await {
                 Ok(banner) if banner.starts_with(b"SSH-2.0-") => return Ok(()),
                 Ok(_) => {}
-                Err(err)
-                    if err.chain().any(|cause| {
-                        matches!(
-                            cause.downcast_ref::<std::io::Error>(),
-                            Some(io_err) if io_err.kind() == std::io::ErrorKind::TimedOut
-                        )
-                    }) || err.to_string().contains("timed out waiting for SSH banner") => {}
+                Err(err) if is_retryable_startup_banner_error(&err) => {}
                 Err(err) => return Err(err),
             }
         }
 
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn is_retryable_startup_banner_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+    }) || matches!(
+        err.to_string().as_str(),
+        message if message.contains("timed out waiting for SSH banner")
+            || message.contains("connection closed before sending SSH banner")
+    )
 }
 
 fn parse_no_new_privs(text: &str) -> Option<u32> {
@@ -893,6 +940,12 @@ impl SpawnedBinaryServer {
 
     fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        self.child
+            .try_wait()
+            .context("failed to poll binary server child status")
     }
 
     fn stop(&mut self) -> Result<()> {
