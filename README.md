@@ -1,13 +1,11 @@
 # narrowd
 
-`narrowd` is a small, single-user Rust SSH daemon built around `russh`.
+`narrowd` is a security hardened, single-user Rust SSH daemon built around `russh`.
 
 It is designed as a `ssh`- and `scp`-compatible lightweight remote-access daemon for one Unix account.
 But its explicitly NOT a full drop-in replacement for a hardened multi-user `sshd`.
 
-License: MIT. See [`LICENSE`](LICENSE).
-
-Current MVP surface:
+Current feature surface:
 
 - public-key auth against one `authorized_keys` file
 - interactive shell as the daemon process user
@@ -53,11 +51,11 @@ Compared to an unrestricted OpenSSH login for the same Unix user:
 Reasonable use cases:
 
 - personal remote access to your own machine, dev box, lab host, or VM
-- access protected by another trust boundary such as Tailscale, WireGuard, a VPN, or a strict source-IP firewall
+- for sensitive infratructure: access protected by another trust boundary such as Tailscale, WireGuard, a VPN, or a strict source-IP firewall
 - setups where every accepted key is fully trusted to act as the daemon process user
 - environments where unrestricted shell and port forwarding are desired features rather than policy violations
 
-Use cases where `narrowd` is not a good fit:
+Use cases where `narrowd` is NOT a good fit:
 
 - a general-purpose internet-facing SSH service for multiple users
 - systems that rely on `authorized_keys` restrictions or fine-grained SSH policy enforcement instead of plain allow-or-deny keys
