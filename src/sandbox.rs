@@ -358,11 +358,13 @@ mod linux {
             libc::SYS_readv,
             libc::SYS_recvfrom,
             libc::SYS_recvmsg,
+            libc::SYS_rseq,
             libc::SYS_rt_sigaction,
             libc::SYS_rt_sigprocmask,
             libc::SYS_rt_sigreturn,
             libc::SYS_sendmsg,
             libc::SYS_sendto,
+            libc::SYS_set_robust_list,
             libc::SYS_setsockopt,
             libc::SYS_shutdown,
             libc::SYS_sigaltstack,
@@ -469,6 +471,12 @@ mod linux {
             assert!(errno_syscalls().contains(&libc::SYS_connect));
             assert!(errno_syscalls().contains(&libc::SYS_clone3));
             assert!(errno_syscalls().contains(&libc::SYS_execve));
+        }
+
+        #[test]
+        fn preauth_seccomp_filter_allows_linux_thread_registration_syscalls() {
+            assert!(allowed_syscalls().contains(&libc::SYS_set_robust_list));
+            assert!(allowed_syscalls().contains(&libc::SYS_rseq));
         }
     }
 }

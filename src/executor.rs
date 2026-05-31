@@ -369,7 +369,12 @@ impl ExecutorClient {
         });
 
         let thread_inner = Arc::clone(&inner);
+        let (started_tx, started_rx) = std_mpsc::channel();
         thread::spawn(move || {
+            // Signal only after the thread has fully started running user code.
+            // This keeps the pre-auth seccomp sandbox from racing a half-started
+            // control-reader thread into glibc's thread-registration syscalls.
+            let _ = started_tx.send(());
             let mut reader = reader;
 
             loop {
@@ -427,6 +432,9 @@ impl ExecutorClient {
                 });
             }
         });
+        started_rx
+            .recv()
+            .context("executor control reader thread failed to start")?;
 
         let dispatch_inner = Arc::clone(&inner);
         handle.spawn(async move {
