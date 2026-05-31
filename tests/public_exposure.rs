@@ -217,6 +217,28 @@ async fn main_binary_sets_no_new_privs_only_on_the_preauth_process() -> Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn interactive_shell_sessions_do_not_inherit_no_new_privs() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let client_key = Arc::new(generate_ed25519_key()?);
+    let authorized_keys = format!("{}\n", client_key.public_key().to_openssh()?);
+    let (host_key, authorized_keys_path) = write_binary_server_keys(&tempdir, &authorized_keys)?;
+    let (mut server, addr) =
+        spawn_ready_binary_server(&tempdir, &host_key, &authorized_keys_path).await?;
+
+    let result = shell_with_key(
+        addr,
+        Arc::clone(&client_key),
+        "grep '^NoNewPrivs:' /proc/self/status\nexit\n",
+    )
+    .await?;
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(parse_no_new_privs(&result.stdout), Some(0));
+
+    server.stop()?;
+    Ok(())
+}
+
 #[test]
 fn internal_preauth_sandbox_probe_blocks_writes_and_exec() -> Result<()> {
     let tempdir = TempDir::new()?;
@@ -639,6 +661,53 @@ async fn exec_with_key(
     })
 }
 
+async fn shell_with_key(addr: SocketAddr, key: Arc<PrivateKey>, input: &str) -> Result<ExecResult> {
+    let mut session = connect_client(addr).await.map_err(anyhow::Error::from)?;
+    let auth = session
+        .authenticate_publickey(&daemon_username()?, PrivateKeyWithHashAlg::new(key, None))
+        .await
+        .map_err(anyhow::Error::from)?;
+    if !auth.success() {
+        anyhow::bail!("public-key authentication failed");
+    }
+
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(anyhow::Error::from)?;
+    channel
+        .request_pty(true, "xterm-256color", 120, 40, 0, 0, &[])
+        .await
+        .map_err(anyhow::Error::from)?;
+    channel
+        .request_shell(true)
+        .await
+        .map_err(anyhow::Error::from)?;
+    channel
+        .data_bytes(input.as_bytes().to_vec())
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_status = None;
+
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+            _ => {}
+        }
+    }
+
+    Ok(ExecResult {
+        stdout: String::from_utf8(stdout).context("stdout was not valid UTF-8")?,
+        stderr: String::from_utf8(stderr).context("stderr was not valid UTF-8")?,
+        exit_status: exit_status.context("shell session did not report an exit status")?,
+    })
+}
+
 fn install_test_logger() {
     let entries = LOG_ENTRIES.get_or_init(|| Mutex::new(Vec::new()));
     LOGGER_INIT.call_once(|| {
@@ -810,9 +879,16 @@ fn is_retryable_startup_banner_error(err: &anyhow::Error) -> bool {
 }
 
 fn parse_no_new_privs(text: &str) -> Option<u32> {
-    text.lines()
-        .find_map(|line| line.strip_prefix("NoNewPrivs:"))
-        .and_then(|value| value.trim().parse().ok())
+    let stripped = strip_ansi_escapes(text);
+    for line in stripped.lines() {
+        if let Some(index) = line.find("NoNewPrivs:") {
+            let value = &line[index + "NoNewPrivs:".len()..];
+            if let Ok(parsed) = value.trim().parse() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
 }
 
 fn parse_seccomp_mode(text: &str) -> Option<u32> {
@@ -825,6 +901,44 @@ fn parse_probe_flag(text: &str, key: &str) -> Option<u32> {
     text.lines()
         .find_map(|line| line.strip_prefix(&format!("{key}=")))
         .and_then(|value| value.trim().parse().ok())
+}
+
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            result.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' && matches!(chars.peek().copied(), Some('\\')) {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    result
 }
 
 async fn read_banner(stream: &mut TcpStream) -> Result<Vec<u8>> {
