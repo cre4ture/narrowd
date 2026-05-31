@@ -100,10 +100,12 @@ systemctl --user enable --now narrowd.service
 The generated package is intentionally set up for a `systemd --user` service,
 not a root-owned system daemon. The packaged launcher refuses to start as
 `root`, so the SSH session, SFTP access, and port forwarding all run with the
-permissions of the target login account. The packaged user service restricts
-address families to `AF_UNIX`, `AF_INET`, and `AF_INET6`. `no_new_privs` is
-applied by the main `narrowd` process itself after it has started the separate
-post-auth executor process.
+permissions of the target login account. `no_new_privs` is applied by the main
+`narrowd` process itself after it has started the separate post-auth executor
+process. The packaged user service intentionally does not use
+`RestrictAddressFamilies=` because systemd applies that with seccomp, which
+forces `NoNewPrivs=1` onto the whole service tree and would break post-auth
+tools such as `sudo`.
 
 RDP over SSH tunnel:
 

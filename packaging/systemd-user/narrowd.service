@@ -10,7 +10,6 @@ ExecStart=/usr/lib/narrowd/narrowd-user-service
 Restart=on-failure
 RestartSec=2
 UMask=0077
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=default.target
