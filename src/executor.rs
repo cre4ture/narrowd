@@ -1779,7 +1779,7 @@ impl From<SerializablePtySize> for PtySize {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

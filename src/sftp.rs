@@ -279,7 +279,7 @@ impl russh_sftp::server::Handler for LocalSftp {
 
     async fn symlink(
         &mut self,
-        id: u32,
+        _id: u32,
         linkpath: String,
         targetpath: String,
     ) -> Result<Status, Self::Error> {
@@ -295,7 +295,8 @@ impl russh_sftp::server::Handler for LocalSftp {
             return Err(StatusCode::OpUnsupported.into());
         }
 
-        Ok(Self::ok_status(id))
+        #[cfg(unix)]
+        Ok(Self::ok_status(_id))
     }
 }
 
