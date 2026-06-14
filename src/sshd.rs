@@ -40,6 +40,13 @@ use crate::metrics::ServerMetrics;
 use crate::sandbox;
 
 pub async fn run(config: AppConfig) -> Result<()> {
+    run_until_shutdown(config, std::future::pending()).await
+}
+
+pub async fn run_until_shutdown<F>(config: AppConfig, shutdown: F) -> Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
     let state = Arc::new(AppState::bootstrap(config, None)?);
 
     info!(
@@ -53,7 +60,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
         TcpListener::bind((state.config.listen_address.as_str(), state.config.port)).await?;
     sandbox::enable_no_new_privs()?;
     sandbox::apply_preauth_sandbox(&state.config.authorized_keys_file)?;
-    run_with_listener(state, listener).await
+    run_with_listener_until_shutdown(state, listener, shutdown).await
 }
 
 /// Runs the SSH server on an already-bound listener without applying the normal
@@ -70,21 +77,38 @@ pub async fn run_on_listener_unsandboxed_for_tests(
     executor_program: Option<OsString>,
 ) -> Result<()> {
     let state = Arc::new(AppState::bootstrap(config, executor_program)?);
-    run_with_listener(state, listener).await
+    run_with_listener_until_shutdown(state, listener, std::future::pending()).await
 }
 
-async fn run_with_listener(state: Arc<AppState>, listener: TcpListener) -> Result<()> {
+async fn run_with_listener_until_shutdown<F>(
+    state: Arc<AppState>,
+    listener: TcpListener,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
     let ssh_config = Arc::new(build_ssh_config(&state));
+    tokio::pin!(shutdown);
 
     loop {
-        let (socket, peer_addr) = listener.accept().await?;
-        let state = Arc::clone(&state);
-        let ssh_config = Arc::clone(&ssh_config);
+        tokio::select! {
+            _ = &mut shutdown => {
+                break;
+            }
+            accepted = listener.accept() => {
+                let (socket, peer_addr) = accepted?;
+                let state = Arc::clone(&state);
+                let ssh_config = Arc::clone(&ssh_config);
 
-        let _task = spawn_supervised_connection(peer_addr, async move {
-            serve_connection(state, ssh_config, socket, peer_addr).await
-        });
+                let _task = spawn_supervised_connection(peer_addr, async move {
+                    serve_connection(state, ssh_config, socket, peer_addr).await
+                });
+            }
+        }
     }
+
+    Ok(())
 }
 
 fn spawn_supervised_connection<F>(peer_addr: SocketAddr, future: F) -> tokio::task::JoinHandle<()>

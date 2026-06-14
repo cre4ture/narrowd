@@ -1,17 +1,20 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
-#[cfg(unix)]
 use anyhow::Context;
+use anyhow::Result;
 use clap::Parser;
-use narrowd::config::{self, AppConfig, SAMPLE_CONFIG};
+use narrowd::config::{AppConfig, SAMPLE_CONFIG};
 #[cfg(unix)]
 use narrowd::executor;
 #[cfg(unix)]
 use narrowd::sandbox;
 use narrowd::sshd;
 
-#[derive(Debug, Parser)]
+mod logging;
+#[cfg(windows)]
+mod windows_service_runtime;
+
+#[derive(Clone, Debug, Parser)]
 #[command(name = "narrowd", version, about = "Single-user Rust SSH daemon")]
 struct Cli {
     /// Path to a narrowd config file.
@@ -25,6 +28,20 @@ struct Cli {
     /// Print a sample config and exit.
     #[arg(long)]
     print_sample_config: bool,
+
+    /// Append application logs to a rotating log file.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+
+    /// Run under the Windows Service Control Manager.
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    run_windows_service: bool,
+
+    /// Windows service name registered with the Service Control Manager.
+    #[cfg(windows)]
+    #[arg(long, hide = true, requires = "run_windows_service")]
+    service_name: Option<String>,
 
     /// Internal executor process mode (Unix only).
     #[cfg(unix)]
@@ -47,21 +64,32 @@ struct Cli {
     internal_preauth_default_deny_probe: Option<PathBuf>,
 }
 
-fn init_logging(level: config::LogLevel) {
-    let mut builder = env_logger::Builder::new();
-    builder.filter_level(level.to_level_filter());
-
-    if std::env::var_os("RUST_LOG").is_some() {
-        builder.parse_default_env();
-    }
-
-    builder.init();
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    #[cfg(windows)]
+    if cli.run_windows_service {
+        let service_name = cli
+            .service_name
+            .clone()
+            .context("missing --service-name for --run-windows-service mode")?;
+        return windows_service_runtime::dispatch(
+            windows_service_runtime::WindowsServiceLaunchOptions {
+                service_name,
+                config_path: cli.config.clone(),
+                log_file: cli.log_file.clone(),
+            },
+        );
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create Tokio runtime")?;
+    runtime.block_on(run_cli(cli))
+}
+
+async fn run_cli(cli: Cli) -> Result<()> {
     #[cfg(unix)]
     if cli.internal_executor {
         let control_fd = cli
@@ -87,7 +115,7 @@ async fn main() -> Result<()> {
     }
 
     let config = AppConfig::load(cli.config)?;
-    init_logging(config.log_level);
+    logging::init(config.log_level, cli.log_file)?;
 
     if cli.check_config {
         println!("config ok");

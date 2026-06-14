@@ -589,6 +589,6 @@ mod tests {
     #[test]
     fn packaged_example_matches_sample_config() {
         let packaged_example = include_str!("../narrowd.conf.example");
-        assert_eq!(packaged_example, SAMPLE_CONFIG);
+        assert_eq!(packaged_example.replace("\r\n", "\n"), SAMPLE_CONFIG);
     }
 }

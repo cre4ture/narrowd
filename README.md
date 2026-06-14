@@ -105,6 +105,20 @@ process. The packaged user service intentionally does not use
 forces `NoNewPrivs=1` onto the whole service tree and would break post-auth
 tools such as `sudo`.
 
+Windows service install:
+
+```powershell
+cargo build --release
+powershell -ExecutionPolicy Bypass -File .\Install-Narrowd.ps1 `
+  -UserName your-windows-user `
+  -BinaryPath "$PWD\target\release\narrowd.exe"
+```
+
+The Windows installer uses `narrowd`'s built-in native service mode, so no
+external wrapper such as NSSM is required. It writes the service config under
+`%APPDATA%\narrowd`, runs the service as the target user account, and writes
+rotating logs to `%APPDATA%\narrowd\logs\narrowd.log`.
+
 RDP over SSH tunnel:
 
 ```bash
