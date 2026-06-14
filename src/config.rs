@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use log::LevelFilter;
+use serde::{Deserialize, Serialize};
 
 pub const SAMPLE_CONFIG: &str = "\
 # narrowd sample config
@@ -15,6 +16,7 @@ HostKey ~/.config/narrowd/ssh_host_ed25519_key
 AuthorizedKeysFile ~/.ssh/authorized_keys
 
 Shell /bin/bash
+ExecMode shell-login
 PermitTTY yes
 PermitExec yes
 
@@ -97,6 +99,84 @@ impl fmt::Display for LogLevel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum ExecMode {
+    ShellLogin,
+    ShellCommand,
+    PowerShell,
+    Cmd,
+}
+
+impl ExecMode {
+    pub fn parse(input: &str) -> Result<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "shell-login" | "login-shell" => Ok(Self::ShellLogin),
+            "shell-command" | "command-shell" | "shell" => Ok(Self::ShellCommand),
+            "powershell" | "pwsh" => Ok(Self::PowerShell),
+            "cmd" | "cmd.exe" => Ok(Self::Cmd),
+            other => bail!("unsupported ExecMode value: {other}"),
+        }
+    }
+
+    pub fn default_for_current_platform() -> Self {
+        if cfg!(windows) {
+            Self::PowerShell
+        } else {
+            Self::ShellLogin
+        }
+    }
+
+    pub fn command_flag(self) -> &'static str {
+        match self {
+            Self::ShellLogin => "-lc",
+            Self::ShellCommand => "-c",
+            Self::PowerShell => "-Command",
+            Self::Cmd => "/C",
+        }
+    }
+
+    fn validate_shell(self, shell: &Path) -> Result<()> {
+        let shell_name = shell
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase());
+
+        match self {
+            Self::PowerShell => {
+                if !matches!(shell_name.as_deref(), Some("powershell" | "pwsh")) {
+                    bail!(
+                        "ExecMode powershell requires Shell to point to powershell.exe or pwsh, got {}",
+                        shell.display()
+                    );
+                }
+            }
+            Self::Cmd => {
+                if !matches!(shell_name.as_deref(), Some("cmd")) {
+                    bail!(
+                        "ExecMode cmd requires Shell to point to cmd.exe, got {}",
+                        shell.display()
+                    );
+                }
+            }
+            Self::ShellLogin | Self::ShellCommand => {}
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for ExecMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::ShellLogin => "shell-login",
+            Self::ShellCommand => "shell-command",
+            Self::PowerShell => "powershell",
+            Self::Cmd => "cmd",
+        };
+        write!(f, "{text}")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub listen_address: String,
@@ -104,6 +184,7 @@ pub struct AppConfig {
     pub host_key: PathBuf,
     pub authorized_keys_file: PathBuf,
     pub shell: PathBuf,
+    pub exec_mode: ExecMode,
     pub permit_tty: bool,
     pub permit_exec: bool,
     pub sftp_enabled: bool,
@@ -151,6 +232,7 @@ impl AppConfig {
             config.apply_text(&text, path.parent().unwrap_or(Path::new(".")))?;
         }
 
+        config.validate()?;
         Ok(config)
     }
 
@@ -168,6 +250,7 @@ impl AppConfig {
             } else {
                 "/bin/bash"
             }),
+            exec_mode: ExecMode::default_for_current_platform(),
             permit_tty: true,
             permit_exec: true,
             sftp_enabled: true,
@@ -202,6 +285,14 @@ impl AppConfig {
         })
     }
 
+    fn validate(&self) -> Result<()> {
+        if self.permit_exec {
+            self.exec_mode.validate_shell(&self.shell)?;
+        }
+
+        Ok(())
+    }
+
     fn apply_text(&mut self, text: &str, base_dir: &Path) -> Result<()> {
         for (idx, raw_line) in text.lines().enumerate() {
             let line_number = idx + 1;
@@ -234,6 +325,10 @@ impl AppConfig {
                 }
                 "shell" => {
                     self.shell = resolve_shell_command_or_path(&values.join(" "), base_dir)?;
+                }
+                "execmode" => {
+                    self.exec_mode = ExecMode::parse(values[0])
+                        .with_context(|| format!("invalid ExecMode on line {line_number}"))?;
                 }
                 "permittty" => {
                     self.permit_tty = parse_bool(values[0])
@@ -555,7 +650,7 @@ mod tests {
         let mut config = AppConfig::defaults().unwrap();
         config
             .apply_text(
-                "MaxUnauthConnectionsGlobal 10\nMaxUnauthConnectionsPerIp 2\nAuthFailureBanThreshold 5\nAuthFailureBanWindow 30s\nAuthorizedKeysReloadInterval 3s\nKexStartTimeout 7s\n",
+                "MaxUnauthConnectionsGlobal 10\nMaxUnauthConnectionsPerIp 2\nAuthFailureBanThreshold 5\nAuthFailureBanWindow 30s\nAuthorizedKeysReloadInterval 3s\nKexStartTimeout 7s\nExecMode shell-command\n",
                 Path::new("/tmp"),
             )
             .unwrap();
@@ -569,6 +664,7 @@ mod tests {
             Duration::from_secs(3)
         );
         assert_eq!(config.kex_start_timeout, Duration::from_secs(7));
+        assert_eq!(config.exec_mode, ExecMode::ShellCommand);
     }
 
     #[test]
@@ -623,5 +719,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.shell, Path::new("/tmp").join("bin/custom-shell.exe"));
+    }
+
+    #[test]
+    fn rejects_incompatible_exec_mode_shell_combo() {
+        let mut config = AppConfig::defaults().unwrap();
+        config
+            .apply_text(
+                "Shell /bin/bash\nExecMode powershell\nPermitExec yes\n",
+                Path::new("/tmp"),
+            )
+            .unwrap();
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("ExecMode powershell"));
     }
 }

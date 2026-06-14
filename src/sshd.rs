@@ -200,8 +200,12 @@ impl AppState {
             );
         }
 
-        let executor =
-            ExecutorClient::spawn(config.shell.clone(), home_dir.clone(), executor_program)?;
+        let executor = ExecutorClient::spawn(
+            config.shell.clone(),
+            config.exec_mode,
+            home_dir.clone(),
+            executor_program,
+        )?;
 
         Ok(Self {
             admission: AdmissionController::new(AdmissionConfig::from_app_config(&config)),
@@ -1186,10 +1190,7 @@ async fn launch_process(
     Ok(())
 }
 
-async fn bridge_process_channel(
-    channel: Channel<Msg>,
-    stream: ServiceStream,
-) -> Result<()> {
+async fn bridge_process_channel(channel: Channel<Msg>, stream: ServiceStream) -> Result<()> {
     let (mut chan_read, chan_write) = channel.split();
     let (mut stream_read, mut stream_write) = tokio::io::split(stream);
     let input_task =

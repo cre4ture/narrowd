@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::Stdio;
 #[cfg(unix)]
 use std::process::{Child, Command as StdCommand};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
@@ -46,12 +46,13 @@ use russh::Sig;
 use russh::server;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use tokio::net::UnixStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::config::ExecMode;
 use crate::sftp::LocalSftp;
 
 /// On Unix the executor runs in a separate process and communicates via a Unix
@@ -142,6 +143,7 @@ pub enum ProcessOutput {
 struct ExecutorHello {
     home_dir: PathBuf,
     shell: PathBuf,
+    exec_mode: ExecMode,
 }
 
 pub struct StartedRemoteForward {
@@ -346,6 +348,7 @@ struct RemoteForwardRegistration {
 impl ExecutorClient {
     pub fn spawn(
         shell: PathBuf,
+        exec_mode: ExecMode,
         home_dir: PathBuf,
         program_override: Option<OsString>,
     ) -> Result<Self> {
@@ -396,7 +399,11 @@ impl ExecutorClient {
         let mut reader = ControlReader { fd: read_fd };
         let mut writer = ControlWriter { fd: write_fd };
         writer.send(
-            &ExecutorRequest::Hello(ExecutorHello { home_dir, shell }),
+            &ExecutorRequest::Hello(ExecutorHello {
+                home_dir,
+                shell,
+                exec_mode,
+            }),
             None,
         )?;
 
@@ -989,12 +996,17 @@ struct RemoteForwardRegistration {
 impl ExecutorClient {
     pub fn spawn(
         shell: PathBuf,
+        exec_mode: ExecMode,
         home_dir: PathBuf,
         _program_override: Option<OsString>,
     ) -> Result<Self> {
         Ok(Self {
             inner: Arc::new(ExecutorClientInner {
-                hello: ExecutorHello { shell, home_dir },
+                hello: ExecutorHello {
+                    shell,
+                    home_dir,
+                    exec_mode,
+                },
                 next_forward_token: AtomicU64::new(1),
                 remote_forward_regs: Mutex::new(HashMap::new()),
                 remote_forwards: Mutex::new(HashMap::new()),
@@ -1009,6 +1021,7 @@ impl ExecutorClient {
                 hello: ExecutorHello {
                     home_dir: std::env::temp_dir(),
                     shell: PathBuf::from("cmd.exe"),
+                    exec_mode: ExecMode::Cmd,
                 },
                 next_forward_token: AtomicU64::new(1),
                 remote_forward_regs: Mutex::new(HashMap::new()),
@@ -1096,7 +1109,13 @@ impl ExecutorClient {
                         break;
                     }
                 };
-                let reg = match inner.remote_forward_regs.lock().unwrap().get(&token).cloned() {
+                let reg = match inner
+                    .remote_forward_regs
+                    .lock()
+                    .unwrap()
+                    .get(&token)
+                    .cloned()
+                {
                     Some(r) => r,
                     None => break,
                 };
@@ -1180,7 +1199,7 @@ where
             builder.env(key, value);
         }
         if let Some(command) = command {
-            builder.arg("-lc");
+            builder.arg(hello.exec_mode.command_flag());
             builder.arg(command);
         }
 
@@ -1316,7 +1335,7 @@ where
     }
 
     if let Some(command) = request.command {
-        process.arg("-lc");
+        process.arg(hello.exec_mode.command_flag());
         process.arg(command);
     }
 
@@ -1821,6 +1840,7 @@ mod tests {
             &ExecutorRequest::Hello(ExecutorHello {
                 home_dir: PathBuf::from("/tmp"),
                 shell: PathBuf::from("/bin/bash"),
+                exec_mode: ExecMode::ShellLogin,
             }),
             "failed to encode executor control message",
         )
@@ -1861,12 +1881,25 @@ mod windows_tests {
         PathBuf::from("whoami.exe")
     }
 
+    fn windows_powershell_path() -> PathBuf {
+        if let Ok(system_root) = std::env::var("SystemRoot") {
+            let path = PathBuf::from(system_root)
+                .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+            if path.exists() {
+                return path;
+            }
+        }
+
+        PathBuf::from("powershell.exe")
+    }
+
     #[tokio::test]
     async fn pty_process_exit_reports_status_and_closes_stream() {
         let (mut client_stream, service_stream) = tokio::io::duplex(MAX_SESSION_MESSAGE_SIZE);
         let hello = ExecutorHello {
             home_dir: dirs::home_dir().unwrap(),
             shell: windows_whoami_path(),
+            exec_mode: ExecMode::ShellCommand,
         };
         let request = ProcessRequest {
             pty: Some(SerializablePtyRequest {
@@ -1920,7 +1953,10 @@ mod windows_tests {
             }
         }
 
-        assert!(saw_eof, "PTY process did not close the service stream after exit; received outputs: {outputs:?}");
+        assert!(
+            saw_eof,
+            "PTY process did not close the service stream after exit; received outputs: {outputs:?}"
+        );
 
         assert!(
             outputs
@@ -1928,5 +1964,43 @@ mod windows_tests {
                 .any(|message| matches!(message, ProcessOutput::ExitStatus(0))),
             "expected PTY process to report exit status 0, got {outputs:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn powershell_exec_mode_runs_exec_requests() {
+        let (mut client_stream, service_stream) = tokio::io::duplex(MAX_SESSION_MESSAGE_SIZE);
+        let hello = ExecutorHello {
+            home_dir: dirs::home_dir().unwrap(),
+            shell: windows_powershell_path(),
+            exec_mode: ExecMode::PowerShell,
+        };
+        let request = ProcessRequest {
+            pty: None,
+            env: BTreeMap::new(),
+            command: Some("cmd /c echo executor-ok".to_string()),
+        };
+
+        start_piped_process_service(hello, request, service_stream)
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_status = None;
+
+        while let Some(message) = read_session_message::<_, ProcessOutput>(&mut client_stream)
+            .await
+            .unwrap()
+        {
+            match message {
+                ProcessOutput::Stdout(data) => stdout.extend_from_slice(&data),
+                ProcessOutput::Stderr(data) => stderr.extend_from_slice(&data),
+                ProcessOutput::ExitStatus(code) => exit_status = Some(code),
+            }
+        }
+
+        assert_eq!(exit_status, Some(0));
+        assert_eq!(String::from_utf8(stdout).unwrap(), "executor-ok\r\n");
+        assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     }
 }

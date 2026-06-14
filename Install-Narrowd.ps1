@@ -593,6 +593,7 @@ if ((Test-Path $configFile) -and -not $Force) {
             "AuthorizedKeysFile $ak"
             ''
             "Shell $shellPath"
+            'ExecMode powershell'
             'PermitTTY yes'
             'PermitExec yes'
             ''

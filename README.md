@@ -9,7 +9,7 @@ Current feature surface:
 
 - public-key auth against one `authorized_keys` file
 - interactive shell as the daemon process user
-- `exec` requests via `bash -lc`
+- `exec` requests via the configured shell wrapper (`ExecMode`)
 - SFTP subsystem backed by the local filesystem
 - local and remote TCP forwarding
 
@@ -123,7 +123,9 @@ The Windows installer uses `narrowd`'s built-in native service mode, so no
 external wrapper such as NSSM is required. It writes the service config,
 machine-local host key, and logs under `%LOCALAPPDATA%\narrowd`, which is a
 better fit than `%APPDATA%` because these artifacts should stay local to the
-machine rather than roam with the user's profile.
+machine rather than roam with the user's profile. The generated Windows config
+also sets `ExecMode powershell` so SSH `exec` requests remain compatible with
+the default PowerShell shell.
 
 RDP over SSH tunnel:
 

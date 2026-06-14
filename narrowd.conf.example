@@ -7,6 +7,7 @@ HostKey ~/.config/narrowd/ssh_host_ed25519_key
 AuthorizedKeysFile ~/.ssh/authorized_keys
 
 Shell /bin/bash
+ExecMode shell-login
 PermitTTY yes
 PermitExec yes
 
