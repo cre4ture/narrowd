@@ -257,6 +257,7 @@ if ((Test-Path $configFile) -and -not $Force) {
     $ak = $authKeysFile -replace '\\', '/'
 
     # Write with UTF-8 (no BOM) so narrowd can read it
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $configContent = @"
 # narrowd config — managed by Install-Narrowd.ps1
 # Daemon runs as: $accountFqn
@@ -297,8 +298,7 @@ KeepaliveMax 3
 
 LogLevel info
 "@
-    [System.IO.File]::WriteAllText($configFile, $configContent,
-        [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($configFile, $configContent, $utf8NoBom)
     OK $configFile
 }
 
