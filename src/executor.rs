@@ -1,26 +1,44 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::io::{IoSlice, IoSliceMut, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
-use std::os::unix::process::CommandExt;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command as StdCommand, Stdio};
+#[cfg(unix)]
+use std::process::{Child, Command as StdCommand};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
 
+#[cfg(unix)]
+use std::io::{IoSlice, IoSliceMut};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as StdUnixStream;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use anyhow::{Context, Result, anyhow};
-use log::{debug, warn};
+use log::debug;
+#[cfg(unix)]
+use log::warn;
+
+#[cfg(unix)]
 use nix::cmsg_space;
+#[cfg(unix)]
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+#[cfg(unix)]
 use nix::libc;
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill, killpg};
+#[cfg(unix)]
 use nix::sys::socket::{
     AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, recvmsg,
     sendmsg, socketpair,
 };
+#[cfg(unix)]
 use nix::unistd::{Pid, dup};
+
 use portable_pty::{
     Child as PtyChild, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system,
 };
@@ -28,13 +46,26 @@ use russh::Sig;
 use russh::server;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::sftp::LocalSftp;
 
+/// On Unix the executor runs in a separate process and communicates via a Unix
+/// domain socket pair.  On other platforms it runs in-process and the "service
+/// stream" is an in-memory duplex channel.
+#[cfg(unix)]
+pub type ServiceStream = tokio::net::UnixStream;
+
+#[cfg(not(unix))]
+pub type ServiceStream = tokio::io::DuplexStream;
+
+#[cfg(unix)]
 const CONTROL_FD: RawFd = 3;
+#[cfg(unix)]
 const MAX_CONTROL_MESSAGE_SIZE: usize = 64 * 1024;
 const MAX_SESSION_MESSAGE_SIZE: usize = 1024 * 1024;
 
@@ -52,27 +83,6 @@ where
 #[derive(Clone)]
 pub struct ExecutorClient {
     inner: Arc<ExecutorClientInner>,
-}
-
-struct ExecutorClientInner {
-    writer: Mutex<ControlWriter>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<ExecutorResponse>>>,
-    remote_forwards: Mutex<HashMap<u64, RemoteForwardRegistration>>,
-    next_request_id: AtomicU64,
-    next_forward_token: AtomicU64,
-    child: Mutex<Option<Child>>,
-}
-
-#[derive(Clone)]
-struct RemoteForwardRegistration {
-    session_handle: server::Handle,
-    connected_address: String,
-    connected_port: u32,
-}
-
-pub struct StartedRemoteForward {
-    pub token: u64,
-    pub bound_port: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -113,6 +123,36 @@ pub enum ExecutorSignal {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub enum ProcessInput {
+    Data(Vec<u8>),
+    Signal(ExecutorSignal),
+    Resize(SerializablePtySize),
+    Eof,
+    Close,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ProcessOutput {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    ExitStatus(u32),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ExecutorHello {
+    home_dir: PathBuf,
+    shell: PathBuf,
+}
+
+pub struct StartedRemoteForward {
+    pub token: u64,
+    pub bound_port: u32,
+}
+
+// ─── Unix-only IPC machinery ─────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 enum ExecutorRequest {
     Hello(ExecutorHello),
     StartProcess {
@@ -139,6 +179,7 @@ enum ExecutorRequest {
     },
 }
 
+#[cfg(unix)]
 #[derive(Debug, Deserialize, Serialize)]
 enum ExecutorResponse {
     HelloAck,
@@ -157,47 +198,30 @@ enum ExecutorResponse {
     },
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 enum ResponseDetail {
     Empty,
     BoundPort(u16),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub enum ProcessInput {
-    Data(Vec<u8>),
-    Signal(ExecutorSignal),
-    Resize(SerializablePtySize),
-    Eof,
-    Close,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub enum ProcessOutput {
-    Stdout(Vec<u8>),
-    Stderr(Vec<u8>),
-    ExitStatus(u32),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ExecutorHello {
-    home_dir: PathBuf,
-    shell: PathBuf,
-}
-
+#[cfg(unix)]
 struct ControlReader {
     fd: OwnedFd,
 }
 
+#[cfg(unix)]
 struct ControlWriter {
     fd: OwnedFd,
 }
 
+#[cfg(unix)]
 struct TransportPacket<T> {
     message: T,
     attached_fd: Option<OwnedFd>,
 }
 
+#[cfg(unix)]
 struct RemoteForwardEvent {
     token: u64,
     originator_address: String,
@@ -205,12 +229,16 @@ struct RemoteForwardEvent {
     stream_fd: OwnedFd,
 }
 
+#[cfg(unix)]
 struct ExecutorState {
     writer: Arc<Mutex<ControlWriter>>,
     hello: Option<ExecutorHello>,
     remote_forwards: HashMap<u64, tokio::task::JoinHandle<()>>,
 }
 
+// ─── Unix executor entry point (child process) ───────────────────────────────
+
+#[cfg(unix)]
 pub async fn run_from_control_fd(control_fd: RawFd) -> Result<()> {
     let control_fd = unsafe { OwnedFd::from_raw_fd(control_fd) };
     let read_fd = dup(&control_fd).context("failed to duplicate executor control fd for reads")?;
@@ -294,6 +322,27 @@ pub async fn run_from_control_fd(control_fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+// ─── Unix ExecutorClient (separate child process via socket pair) ─────────────
+
+#[cfg(unix)]
+struct ExecutorClientInner {
+    writer: Mutex<ControlWriter>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<ExecutorResponse>>>,
+    remote_forwards: Mutex<HashMap<u64, RemoteForwardRegistration>>,
+    next_request_id: AtomicU64,
+    next_forward_token: AtomicU64,
+    child: Mutex<Option<Child>>,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct RemoteForwardRegistration {
+    session_handle: server::Handle,
+    connected_address: String,
+    connected_port: u32,
+}
+
+#[cfg(unix)]
 impl ExecutorClient {
     pub fn spawn(
         shell: PathBuf,
@@ -472,7 +521,7 @@ impl ExecutorClient {
         })
     }
 
-    pub async fn start_process(&self, request: ProcessRequest) -> Result<UnixStream> {
+    pub async fn start_process(&self, request: ProcessRequest) -> Result<ServiceStream> {
         let (parent_stream, child_fd) = unix_service_channel()?;
         let request_id = self.inner.next_request_id();
         let response = self
@@ -496,7 +545,7 @@ impl ExecutorClient {
         }
     }
 
-    pub async fn start_sftp(&self) -> Result<UnixStream> {
+    pub async fn start_sftp(&self) -> Result<ServiceStream> {
         let (parent_stream, child_fd) = unix_service_channel()?;
         let request_id = self.inner.next_request_id();
         let response = self
@@ -514,7 +563,7 @@ impl ExecutorClient {
         }
     }
 
-    pub async fn connect_tcp(&self, host: String, port: u16) -> Result<UnixStream> {
+    pub async fn connect_tcp(&self, host: String, port: u16) -> Result<ServiceStream> {
         let (parent_stream, child_fd) = unix_service_channel()?;
         let request_id = self.inner.next_request_id();
         let response = self
@@ -612,6 +661,7 @@ impl ExecutorClient {
     }
 }
 
+#[cfg(unix)]
 impl ExecutorClientInner {
     fn next_request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
@@ -641,6 +691,7 @@ impl ExecutorClientInner {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ExecutorClientInner {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.lock().unwrap().take() {
@@ -650,6 +701,9 @@ impl Drop for ExecutorClientInner {
     }
 }
 
+// ─── Unix ExecutorState (runs inside the child executor process) ──────────────
+
+#[cfg(unix)]
 impl ExecutorState {
     fn hello(&self) -> Result<&ExecutorHello> {
         self.hello
@@ -794,6 +848,9 @@ impl ExecutorState {
     }
 }
 
+// ─── Unix control channel recv/send ──────────────────────────────────────────
+
+#[cfg(unix)]
 impl ControlReader {
     fn recv<T>(&mut self) -> Result<TransportPacket<T>>
     where
@@ -850,6 +907,7 @@ impl ControlReader {
     }
 }
 
+#[cfg(unix)]
 impl ControlWriter {
     fn send<T: Serialize>(&mut self, message: &T, attached_fd: Option<OwnedFd>) -> Result<()> {
         let payload = encode_message(message, "failed to encode executor control message")?;
@@ -869,6 +927,9 @@ impl ControlWriter {
     }
 }
 
+// ─── Unix dispatch of incoming remote-forward connections ────────────────────
+
+#[cfg(unix)]
 async fn dispatch_remote_forward_event(
     inner: &ExecutorClientInner,
     event: RemoteForwardEvent,
@@ -902,11 +963,202 @@ async fn dispatch_remote_forward_event(
     Ok(())
 }
 
-async fn start_pty_process_service(
+// ─── Non-Unix (in-process) ExecutorClient ────────────────────────────────────
+//
+// On Windows (and any other non-Unix platform) there is no separate executor
+// process.  Each service request spawns a Tokio task that runs the service
+// function directly.  The "service stream" is an in-memory duplex channel.
+
+#[cfg(not(unix))]
+struct ExecutorClientInner {
+    hello: ExecutorHello,
+    next_forward_token: AtomicU64,
+    remote_forward_regs: Mutex<HashMap<u64, RemoteForwardRegistration>>,
+    remote_forwards: Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>,
+}
+
+#[cfg(not(unix))]
+#[derive(Clone)]
+struct RemoteForwardRegistration {
+    session_handle: server::Handle,
+    connected_address: String,
+    connected_port: u32,
+}
+
+#[cfg(not(unix))]
+impl ExecutorClient {
+    pub fn spawn(
+        shell: PathBuf,
+        home_dir: PathBuf,
+        _program_override: Option<OsString>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(ExecutorClientInner {
+                hello: ExecutorHello { shell, home_dir },
+                next_forward_token: AtomicU64::new(1),
+                remote_forward_regs: Mutex::new(HashMap::new()),
+                remote_forwards: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn inert_for_tests() -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(ExecutorClientInner {
+                hello: ExecutorHello {
+                    home_dir: std::env::temp_dir(),
+                    shell: PathBuf::from("cmd.exe"),
+                },
+                next_forward_token: AtomicU64::new(1),
+                remote_forward_regs: Mutex::new(HashMap::new()),
+                remote_forwards: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
+    pub async fn start_process(&self, request: ProcessRequest) -> Result<ServiceStream> {
+        let (parent, child) = tokio::io::duplex(MAX_SESSION_MESSAGE_SIZE);
+        let hello = self.inner.hello.clone();
+        tokio::spawn(async move {
+            let result = if request.pty.is_some() {
+                start_pty_process_service(hello, request, child).await
+            } else {
+                start_piped_process_service(hello, request, child).await
+            };
+            if let Err(err) = result {
+                debug!("process service ended: {err:#}");
+            }
+        });
+        Ok(parent)
+    }
+
+    pub async fn start_sftp(&self) -> Result<ServiceStream> {
+        let (parent, child) = tokio::io::duplex(MAX_SESSION_MESSAGE_SIZE);
+        let home_dir = self.inner.hello.home_dir.clone();
+        tokio::spawn(async move {
+            let sftp = LocalSftp::new(home_dir);
+            russh_sftp::server::run(child, sftp).await;
+        });
+        Ok(parent)
+    }
+
+    pub async fn connect_tcp(&self, host: String, port: u16) -> Result<ServiceStream> {
+        let target = TcpStream::connect((host.as_str(), port))
+            .await
+            .with_context(|| format!("failed to connect to {host}:{port}"))?;
+        let (parent, child) = tokio::io::duplex(MAX_SESSION_MESSAGE_SIZE);
+        tokio::spawn(async move {
+            if let Err(err) = proxy_byte_streams(child, target).await {
+                debug!("direct-tcpip proxy ended: {err:#}");
+            }
+        });
+        Ok(parent)
+    }
+
+    pub async fn start_remote_forward(
+        &self,
+        session_handle: server::Handle,
+        connected_address: String,
+        bind_address: String,
+        bind_port: u16,
+    ) -> Result<StartedRemoteForward> {
+        let token = self
+            .inner
+            .next_forward_token
+            .fetch_add(1, Ordering::Relaxed);
+        let listener = TcpListener::bind((bind_address.as_str(), bind_port))
+            .await
+            .with_context(|| format!("failed to bind remote forward {bind_address}:{bind_port}"))?;
+        let bound_port = listener
+            .local_addr()
+            .context("failed to inspect remote-forward listener address")?
+            .port();
+
+        let reg = RemoteForwardRegistration {
+            session_handle,
+            connected_address,
+            connected_port: u32::from(bound_port),
+        };
+        self.inner
+            .remote_forward_regs
+            .lock()
+            .unwrap()
+            .insert(token, reg);
+
+        let inner = Arc::clone(&self.inner);
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, origin) = match listener.accept().await {
+                    Ok(a) => a,
+                    Err(err) => {
+                        debug!("remote-forward accept ended: {err}");
+                        break;
+                    }
+                };
+                let reg = match inner.remote_forward_regs.lock().unwrap().get(&token).cloned() {
+                    Some(r) => r,
+                    None => break,
+                };
+                tokio::spawn(async move {
+                    let channel: russh::Channel<russh::server::Msg> = match reg
+                        .session_handle
+                        .channel_open_forwarded_tcpip(
+                            reg.connected_address,
+                            reg.connected_port,
+                            origin.ip().to_string(),
+                            u32::from(origin.port()),
+                        )
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(err) => {
+                            debug!("failed to open forwarded-tcpip channel: {err}");
+                            return;
+                        }
+                    };
+                    if let Err(err) = proxy_byte_streams(channel.into_stream(), stream).await {
+                        debug!("forwarded-tcpip proxy ended: {err:#}");
+                    }
+                });
+            }
+        });
+
+        self.inner
+            .remote_forwards
+            .lock()
+            .unwrap()
+            .insert(token, task);
+
+        Ok(StartedRemoteForward {
+            token,
+            bound_port: u32::from(bound_port),
+        })
+    }
+
+    pub async fn cancel_remote_forward(&self, token: u64) -> Result<()> {
+        self.inner
+            .remote_forward_regs
+            .lock()
+            .unwrap()
+            .remove(&token);
+        if let Some(task) = self.inner.remote_forwards.lock().unwrap().remove(&token) {
+            task.abort();
+        }
+        Ok(())
+    }
+}
+
+// ─── Service functions (shared between Unix executor process and Windows) ─────
+
+async fn start_pty_process_service<S>(
     hello: ExecutorHello,
     request: ProcessRequest,
-    stream: UnixStream,
-) -> Result<()> {
+    stream: S,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let pty = request
         .pty
         .clone()
@@ -945,7 +1197,10 @@ async fn start_pty_process_service(
             .master
             .take_writer()
             .context("failed to take PTY writer")?;
+        #[cfg(unix)]
         let process_group = pair.master.process_group_leader();
+        #[cfg(not(unix))]
+        let process_group: Option<i32> = None;
 
         Ok(PtyLaunch {
             master: pair.master,
@@ -1024,11 +1279,14 @@ async fn start_pty_process_service(
     Ok(())
 }
 
-async fn start_piped_process_service(
+async fn start_piped_process_service<S>(
     hello: ExecutorHello,
     request: ProcessRequest,
-    stream: UnixStream,
-) -> Result<()> {
+    stream: S,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut process = Command::new(&hello.shell);
     process.current_dir(&hello.home_dir);
     process.stdin(Stdio::piped());
@@ -1054,6 +1312,12 @@ async fn start_piped_process_service(
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<ProcessOutput>();
     let (exit_tx, mut exit_rx) = oneshot::channel::<u32>();
 
+    // On non-Unix we use a kill channel to signal the wait task because we
+    // can't send POSIX signals directly.
+    let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
+    let input_kill_tx = kill_tx.clone();
+    let outer_kill_tx = kill_tx;
+
     tokio::spawn(read_process_stream(
         stdout,
         ProcessStream::Stdout,
@@ -1065,13 +1329,22 @@ async fn start_piped_process_service(
         output_tx,
     ));
     tokio::spawn(async move {
-        let code = child.wait().await.map(exit_status_code).unwrap_or(255);
-        let _ = exit_tx.send(code);
+        tokio::select! {
+            result = child.wait() => {
+                let code = result.map(exit_status_code).unwrap_or(255);
+                let _ = exit_tx.send(code);
+            }
+            _ = kill_rx.recv() => {
+                let _ = child.start_kill();
+                let code = child.wait().await.map(exit_status_code).unwrap_or(255);
+                let _ = exit_tx.send(code);
+            }
+        }
     });
 
     tokio::spawn(async move {
         let input_task = tokio::spawn(async move {
-            let _ = handle_piped_service_input(pid, &mut stream_read, stdin).await;
+            let _ = handle_piped_service_input(pid, input_kill_tx, &mut stream_read, stdin).await;
         });
 
         let mut child_exit = None;
@@ -1087,7 +1360,10 @@ async fn start_piped_process_service(
                     match maybe_output {
                         Some(output) => {
                             if send_session_message(&mut stream_write, &output).await.is_err() {
+                                #[cfg(unix)]
                                 let _ = send_signal_to_pid(pid, Signal::SIGKILL);
+                                #[cfg(not(unix))]
+                                let _ = outer_kill_tx.try_send(());
                                 break;
                             }
                         }
@@ -1147,6 +1423,7 @@ where
 
 async fn handle_piped_service_input<R>(
     pid: u32,
+    kill_tx: mpsc::Sender<()>,
     reader: &mut R,
     mut stdin: ChildStdin,
 ) -> Result<()>
@@ -1161,13 +1438,19 @@ where
                 }
             }
             ProcessInput::Signal(signal) => {
+                #[cfg(unix)]
                 let _ = send_signal_to_pid(pid, signal.into());
+                #[cfg(not(unix))]
+                let _ = (pid, signal); // signals are not supported on non-Unix
             }
             ProcessInput::Eof => {
                 let _ = stdin.shutdown().await;
             }
             ProcessInput::Close => {
+                #[cfg(unix)]
                 let _ = send_signal_to_pid(pid, Signal::SIGKILL);
+                #[cfg(not(unix))]
+                let _ = kill_tx.try_send(());
                 break;
             }
             ProcessInput::Resize(_) => {}
@@ -1178,45 +1461,72 @@ where
     Ok(())
 }
 
-async fn read_process_stream<R>(
+async fn read_session_message<R, T>(reader: &mut R) -> Result<Option<T>>
+where
+    R: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    let length = match reader.read_u32().await {
+        Ok(length) => length as usize,
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err).context("failed to read session message length"),
+    };
+
+    if length > MAX_SESSION_MESSAGE_SIZE {
+        anyhow::bail!("session message length {length} exceeds the maximum supported size");
+    }
+
+    let mut buffer = vec![0_u8; length];
+    reader
+        .read_exact(&mut buffer)
+        .await
+        .context("failed to read session message body")?;
+    let message = decode_message(&buffer, "failed to decode session message")?;
+    Ok(Some(message))
+}
+
+async fn send_session_message<W, T>(writer: &mut W, message: &T) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let payload = encode_message(message, "failed to encode session message")?;
+    let length = u32::try_from(payload.len()).context("session message too large")?;
+    writer.write_u32(length).await?;
+    writer.write_all(&payload).await?;
+    Ok(())
+}
+
+fn read_process_stream<R>(
     mut stream: R,
     which: ProcessStream,
     output_tx: mpsc::UnboundedSender<ProcessOutput>,
-) where
+) -> impl std::future::Future<Output = ()> + Send + 'static
+where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let mut buffer = vec![0_u8; 8192];
-
-    loop {
-        match stream.read(&mut buffer).await {
-            Ok(0) => break,
-            Ok(read) => {
-                let chunk = buffer[..read].to_vec();
-                let message = match which {
-                    ProcessStream::Stdout => ProcessOutput::Stdout(chunk),
-                    ProcessStream::Stderr => ProcessOutput::Stderr(chunk),
-                };
-                if output_tx.send(message).is_err() {
+    async move {
+        let mut buffer = vec![0_u8; 8192];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    let chunk = buffer[..read].to_vec();
+                    let message = match which {
+                        ProcessStream::Stdout => ProcessOutput::Stdout(chunk),
+                        ProcessStream::Stderr => ProcessOutput::Stderr(chunk),
+                    };
+                    if output_tx.send(message).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    debug!("process stream read ended: {err}");
                     break;
                 }
             }
-            Err(err) => {
-                debug!("process stream read ended: {err}");
-                break;
-            }
         }
     }
-}
-
-async fn proxy_byte_streams<A, B>(mut left: A, mut right: B) -> Result<()>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    tokio::io::copy_bidirectional(&mut left, &mut right)
-        .await
-        .map(|_| ())
-        .map_err(Into::into)
 }
 
 fn run_pty_reader(
@@ -1266,9 +1576,12 @@ fn run_pty_control(
                 let _ = master.resize(size);
             }
             PtyControl::Signal(signal) => {
+                #[cfg(unix)]
                 if let Some(group) = process_group {
                     let _ = send_signal_to_process_group(group, signal.into());
                 }
+                #[cfg(not(unix))]
+                let _ = (process_group, signal); // POSIX signals not supported on non-Unix
             }
             PtyControl::Eof => {
                 writer.take();
@@ -1282,48 +1595,27 @@ fn run_pty_control(
     }
 }
 
-async fn send_session_message<W, T>(writer: &mut W, message: &T) -> Result<()>
+async fn proxy_byte_streams<A, B>(mut left: A, mut right: B) -> Result<()>
 where
-    W: AsyncWrite + Unpin,
-    T: Serialize,
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
 {
-    let payload = encode_message(message, "failed to encode session message")?;
-    let length = u32::try_from(payload.len()).context("session message too large")?;
-    writer.write_u32(length).await?;
-    writer.write_all(&payload).await?;
-    Ok(())
-}
-
-async fn read_session_message<R, T>(reader: &mut R) -> Result<Option<T>>
-where
-    R: AsyncRead + Unpin,
-    T: for<'de> Deserialize<'de>,
-{
-    let length = match reader.read_u32().await {
-        Ok(length) => length as usize,
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err).context("failed to read session message length"),
-    };
-
-    if length > MAX_SESSION_MESSAGE_SIZE {
-        anyhow::bail!("session message length {length} exceeds the maximum supported size");
-    }
-
-    let mut buffer = vec![0_u8; length];
-    reader
-        .read_exact(&mut buffer)
+    tokio::io::copy_bidirectional(&mut left, &mut right)
         .await
-        .context("failed to read session message body")?;
-    let message = decode_message(&buffer, "failed to decode session message")?;
-    Ok(Some(message))
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
+// ─── Unix-only helper functions ───────────────────────────────────────────────
+
+#[cfg(unix)]
 fn unix_service_channel() -> Result<(UnixStream, OwnedFd)> {
     let (parent, child) = StdUnixStream::pair().context("failed to create Unix service stream")?;
     let parent = unix_stream_from_std(parent)?;
     Ok((parent, child.into()))
 }
 
+#[cfg(unix)]
 fn set_cloexec(fd: &OwnedFd) -> Result<()> {
     let current_flags =
         fcntl(fd, FcntlArg::F_GETFD).context("failed to read socket close-on-exec flags")?;
@@ -1333,11 +1625,13 @@ fn set_cloexec(fd: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn unix_stream_from_fd(fd: OwnedFd) -> Result<UnixStream> {
     let stream = StdUnixStream::from(fd);
     unix_stream_from_std(stream)
 }
 
+#[cfg(unix)]
 fn unix_stream_from_std(stream: StdUnixStream) -> Result<UnixStream> {
     stream
         .set_nonblocking(true)
@@ -1345,6 +1639,7 @@ fn unix_stream_from_std(stream: StdUnixStream) -> Result<UnixStream> {
     UnixStream::from_std(stream).context("failed to adopt Unix stream into Tokio")
 }
 
+#[cfg(unix)]
 fn tcp_stream_from_fd(fd: OwnedFd) -> Result<TcpStream> {
     let stream = std::net::TcpStream::from(fd);
     stream
@@ -1353,60 +1648,9 @@ fn tcp_stream_from_fd(fd: OwnedFd) -> Result<TcpStream> {
     TcpStream::from_std(stream).context("failed to adopt TCP stream into Tokio")
 }
 
-fn request_id(request: &ExecutorRequest) -> Option<u64> {
-    match request {
-        ExecutorRequest::Hello(_) => None,
-        ExecutorRequest::StartProcess { request_id, .. }
-        | ExecutorRequest::StartSftp { request_id }
-        | ExecutorRequest::ConnectTcp { request_id, .. }
-        | ExecutorRequest::StartRemoteForward { request_id, .. }
-        | ExecutorRequest::CancelRemoteForward { request_id, .. } => Some(*request_id),
-    }
-}
+// ─── Signal mapping (Unix-only) ───────────────────────────────────────────────
 
-fn executor_program(program_override: Option<OsString>) -> Result<OsString> {
-    if let Some(program) = program_override {
-        return Ok(program);
-    }
-
-    std::env::current_exe()
-        .map(|path| path.into_os_string())
-        .context("failed to resolve current executable for executor spawn")
-}
-
-struct PtyLaunch {
-    master: Box<dyn MasterPty + Send>,
-    reader: Box<dyn Read + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn PtyChild + Send + Sync>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
-    process_group: Option<i32>,
-}
-
-enum PtyControl {
-    Write(Vec<u8>),
-    Resize(PtySize),
-    Signal(ExecutorSignal),
-    Eof,
-    Close,
-}
-
-enum ProcessStream {
-    Stdout,
-    Stderr,
-}
-
-impl From<SerializablePtySize> for PtySize {
-    fn from(value: SerializablePtySize) -> Self {
-        Self {
-            rows: value.rows,
-            cols: value.cols,
-            pixel_width: value.pixel_width,
-            pixel_height: value.pixel_height,
-        }
-    }
-}
-
+#[cfg(unix)]
 impl From<ExecutorSignal> for Signal {
     fn from(value: ExecutorSignal) -> Self {
         match value {
@@ -1444,14 +1688,18 @@ pub fn map_signal(signal: &Sig) -> Option<ExecutorSignal> {
     }
 }
 
+#[cfg(unix)]
 fn send_signal_to_pid(pid: u32, signal: Signal) -> Result<()> {
     let pid = i32::try_from(pid).context("child pid too large")?;
     kill(Pid::from_raw(pid), signal).context("failed to signal child")
 }
 
+#[cfg(unix)]
 fn send_signal_to_process_group(group: i32, signal: Signal) -> Result<()> {
     killpg(Pid::from_raw(group), signal).context("failed to signal child process group")
 }
+
+// ─── Exit status helper ───────────────────────────────────────────────────────
 
 #[cfg(unix)]
 fn exit_status_code(status: std::process::ExitStatus) -> u32 {
@@ -1464,12 +1712,81 @@ fn exit_status_code(status: std::process::ExitStatus) -> u32 {
         .unwrap_or(255)
 }
 
+#[cfg(not(unix))]
+fn exit_status_code(status: std::process::ExitStatus) -> u32 {
+    status.code().map(|code| code as u32).unwrap_or(255)
+}
+
+// ─── Misc helpers ─────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn executor_program(program_override: Option<OsString>) -> Result<OsString> {
+    if let Some(program) = program_override {
+        return Ok(program);
+    }
+
+    std::env::current_exe()
+        .map(|path| path.into_os_string())
+        .context("failed to resolve current executable for executor spawn")
+}
+
+#[cfg(unix)]
+fn request_id(request: &ExecutorRequest) -> Option<u64> {
+    match request {
+        ExecutorRequest::Hello(_) => None,
+        ExecutorRequest::StartProcess { request_id, .. }
+        | ExecutorRequest::StartSftp { request_id }
+        | ExecutorRequest::ConnectTcp { request_id, .. }
+        | ExecutorRequest::StartRemoteForward { request_id, .. }
+        | ExecutorRequest::CancelRemoteForward { request_id, .. } => Some(*request_id),
+    }
+}
+
+// ─── Internal types ───────────────────────────────────────────────────────────
+
+struct PtyLaunch {
+    master: Box<dyn MasterPty + Send>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn PtyChild + Send + Sync>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    process_group: Option<i32>,
+}
+
+enum PtyControl {
+    Write(Vec<u8>),
+    Resize(PtySize),
+    Signal(ExecutorSignal),
+    Eof,
+    Close,
+}
+
+enum ProcessStream {
+    Stdout,
+    Stderr,
+}
+
+impl From<SerializablePtySize> for PtySize {
+    fn from(value: SerializablePtySize) -> Self {
+        Self {
+            rows: value.rows,
+            cols: value.cols,
+            pixel_width: value.pixel_width,
+            pixel_height: value.pixel_height,
+        }
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     use std::fs::File;
 
+    #[cfg(unix)]
     #[test]
     fn rejects_control_messages_with_multiple_attached_fds() {
         let (read_fd, write_fd) = socketpair(
@@ -1503,6 +1820,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_child_pids_that_do_not_fit_i32() {
         let err = send_signal_to_pid(i32::MAX as u32 + 1, Signal::SIGTERM).unwrap_err();

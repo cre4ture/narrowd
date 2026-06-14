@@ -163,7 +163,11 @@ impl AppConfig {
             port: 2222,
             host_key: config_root.join("narrowd/ssh_host_ed25519_key"),
             authorized_keys_file: home.join(".ssh/authorized_keys"),
-            shell: PathBuf::from("/bin/bash"),
+            shell: PathBuf::from(if cfg!(windows) {
+                "powershell.exe"
+            } else {
+                "/bin/bash"
+            }),
             permit_tty: true,
             permit_exec: true,
             sftp_enabled: true,

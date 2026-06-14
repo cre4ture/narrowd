@@ -1,9 +1,13 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(unix)]
+use anyhow::Context;
 use clap::Parser;
 use narrowd::config::{self, AppConfig, SAMPLE_CONFIG};
+#[cfg(unix)]
 use narrowd::executor;
+#[cfg(unix)]
 use narrowd::sandbox;
 use narrowd::sshd;
 
@@ -22,19 +26,23 @@ struct Cli {
     #[arg(long)]
     print_sample_config: bool,
 
-    /// Internal executor process mode.
+    /// Internal executor process mode (Unix only).
+    #[cfg(unix)]
     #[arg(long, hide = true)]
     internal_executor: bool,
 
-    /// Control fd inherited by the internal executor process.
+    /// Control fd inherited by the internal executor process (Unix only).
+    #[cfg(unix)]
     #[arg(long, hide = true)]
     control_fd: Option<i32>,
 
-    /// Internal pre-auth sandbox probe mode.
+    /// Internal pre-auth sandbox probe mode (Unix only).
+    #[cfg(unix)]
     #[arg(long, hide = true)]
     internal_preauth_sandbox_probe: Option<PathBuf>,
 
-    /// Internal probe for the pre-auth sandbox default-deny seccomp policy.
+    /// Internal probe for the pre-auth sandbox default-deny seccomp policy (Unix only).
+    #[cfg(unix)]
     #[arg(long, hide = true)]
     internal_preauth_default_deny_probe: Option<PathBuf>,
 }
@@ -54,6 +62,7 @@ fn init_logging(level: config::LogLevel) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    #[cfg(unix)]
     if cli.internal_executor {
         let control_fd = cli
             .control_fd
@@ -61,11 +70,13 @@ async fn main() -> Result<()> {
         return executor::run_from_control_fd(control_fd).await;
     }
 
+    #[cfg(unix)]
     if let Some(probe_path) = cli.internal_preauth_sandbox_probe {
         print!("{}", sandbox::internal_preauth_probe(&probe_path)?);
         return Ok(());
     }
 
+    #[cfg(unix)]
     if let Some(probe_path) = cli.internal_preauth_default_deny_probe {
         return sandbox::internal_preauth_default_deny_probe(&probe_path);
     }

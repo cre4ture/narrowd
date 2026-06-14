@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command as StdCommand, Stdio};

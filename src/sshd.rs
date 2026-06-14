@@ -15,6 +15,7 @@ use anyhow::{Context, Result, anyhow};
 use futures::FutureExt;
 use getrandom::rand_core::UnwrapErr;
 use log::{debug, error, info, warn};
+#[cfg(unix)]
 use nix::unistd::{User, getuid};
 use portable_pty::PtySize;
 use russh::keys::{Algorithm, PrivateKey, ssh_key};
@@ -32,7 +33,7 @@ use crate::authorized_keys::{
 use crate::config::AppConfig;
 use crate::executor::{
     self, ExecutorClient, ProcessInput, ProcessOutput, ProcessRequest, SerializablePtyRequest,
-    SerializablePtySize,
+    SerializablePtySize, ServiceStream,
 };
 use crate::log_limiter::{LogDecision, LogKey, LogLimiter};
 use crate::metrics::ServerMetrics;
@@ -1163,7 +1164,7 @@ async fn launch_process(
 
 async fn bridge_process_channel(
     channel: Channel<Msg>,
-    stream: tokio::net::UnixStream,
+    stream: ServiceStream,
 ) -> Result<()> {
     let (mut chan_read, chan_write) = channel.split();
     let (mut stream_read, mut stream_write) = tokio::io::split(stream);
@@ -1201,7 +1202,7 @@ async fn bridge_process_channel(
 
 async fn handle_process_input(
     chan_read: &mut russh::ChannelReadHalf,
-    stream_write: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
+    stream_write: &mut tokio::io::WriteHalf<ServiceStream>,
 ) -> Result<()> {
     while let Some(message) = chan_read.wait().await {
         match message {
@@ -1417,12 +1418,20 @@ fn to_executor_pty_request(pty: &PtyRequest) -> SerializablePtyRequest {
     }
 }
 
+#[cfg(unix)]
 fn daemon_username() -> Result<String> {
     let uid = getuid();
     let user = User::from_uid(uid)
         .context("failed to resolve daemon user from current uid")?
         .ok_or_else(|| anyhow!("no passwd entry for daemon uid {}", uid.as_raw()))?;
     Ok(user.name)
+}
+
+#[cfg(not(unix))]
+fn daemon_username() -> Result<String> {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .context("failed to determine current username from environment")
 }
 
 fn login_user_matches_daemon(requested_user: &str, daemon_username: &str) -> bool {
