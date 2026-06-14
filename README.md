@@ -109,15 +109,21 @@ Windows service install:
 
 ```powershell
 cargo build --release
-powershell -ExecutionPolicy Bypass -File .\Install-Narrowd.ps1 `
-  -UserName your-windows-user `
-  -BinaryPath "$PWD\target\release\narrowd.exe"
+powershell -ExecutionPolicy Bypass -File .\Install-Narrowd.ps1
 ```
 
+The installer prompts for any missing values and shows defaults for the
+current Windows account, the local `narrowd.exe` build output, port `2222`,
+service name `narrowd`, a stable binary install directory under
+`%LOCALAPPDATA%\narrowd\bin`, and the firewall/reinstall/copy choices. By
+default it copies `narrowd.exe` there so the service keeps working even if you
+delete or change the repo checkout later.
+
 The Windows installer uses `narrowd`'s built-in native service mode, so no
-external wrapper such as NSSM is required. It writes the service config under
-`%APPDATA%\narrowd`, runs the service as the target user account, and writes
-rotating logs to `%APPDATA%\narrowd\logs\narrowd.log`.
+external wrapper such as NSSM is required. It writes the service config,
+machine-local host key, and logs under `%LOCALAPPDATA%\narrowd`, which is a
+better fit than `%APPDATA%` because these artifacts should stay local to the
+machine rather than roam with the user's profile.
 
 RDP over SSH tunnel:
 

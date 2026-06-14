@@ -9,6 +9,7 @@
     any impersonation layer.
 
     This script:
+      - Optionally copies narrowd.exe to a stable install directory
       - Resolves the user's Windows profile directory
       - Generates an ed25519 SSH host key
       - Writes a narrowd config with absolute paths
@@ -23,9 +24,15 @@
 .PARAMETER UserName
     Windows account that owns all SSH sessions (for example "alice" or
     "DOMAIN\alice"). The daemon runs as this account.
+    When prompted interactively, the default is the current Windows identity.
 
 .PARAMETER BinaryPath
     Full path to narrowd.exe.
+    When prompted interactively, the default is the first existing path from:
+      - target\release\narrowd.exe under the script directory
+      - target\debug\narrowd.exe under the script directory
+      - narrowd.exe under the script directory
+      - narrowd.exe from PATH
 
 .PARAMETER Port
     TCP port narrowd listens on. Default: 2222.
@@ -33,11 +40,26 @@
 .PARAMETER ServiceName
     Windows service name. Default: narrowd.
 
+.PARAMETER BinaryInstallDir
+    Directory where a stable copy of narrowd.exe should be placed when the
+    binary copy step is enabled. Default: AppData\Local\narrowd\bin under the
+    target user's profile.
+
 .PARAMETER Force
     Remove and reinstall an existing service, overwrite an existing config.
+    When prompted interactively, the default is No.
 
 .PARAMETER NoFirewall
     Skip creating the inbound firewall rule.
+    When prompted interactively, the default is No.
+
+.PARAMETER NoBinaryCopy
+    Skip copying narrowd.exe to the stable install directory and use the
+    provided BinaryPath directly. When prompted interactively, the default is
+    No.
+
+.EXAMPLE
+    .\Install-Narrowd.ps1
 
 .EXAMPLE
     .\Install-Narrowd.ps1 -UserName alice -BinaryPath "C:\Tools\narrowd\narrowd.exe"
@@ -47,10 +69,8 @@
 #>
 
 param(
-    [Parameter(Mandatory)]
     [string]$UserName,
 
-    [Parameter(Mandatory)]
     [string]$BinaryPath,
 
     [ValidateRange(1, 65535)]
@@ -58,9 +78,13 @@ param(
 
     [string]$ServiceName = 'narrowd',
 
+    [string]$BinaryInstallDir,
+
     [switch]$Force,
 
-    [switch]$NoFirewall
+    [switch]$NoFirewall,
+
+    [switch]$NoBinaryCopy
 )
 
 Set-StrictMode -Version Latest
@@ -69,6 +93,107 @@ $ErrorActionPreference = 'Stop'
 function Step([string]$Message) { Write-Host "`n==> $Message" -ForegroundColor Cyan }
 function OK([string]$Message)   { Write-Host "    ok  $Message" -ForegroundColor Green }
 function Warn([string]$Message) { Write-Host "    WARN $Message" -ForegroundColor Yellow }
+
+function Get-DefaultUserName() {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if (-not [string]::IsNullOrWhiteSpace($identity)) {
+        return $identity
+    }
+
+    if ($env:USERDOMAIN -and $env:USERNAME) {
+        return "$($env:USERDOMAIN)\$($env:USERNAME)"
+    }
+
+    if ($env:USERNAME) {
+        return $env:USERNAME
+    }
+
+    throw "Unable to determine a default Windows account. Pass -UserName explicitly."
+}
+
+function Get-DefaultBinaryPath() {
+    $candidates = @(
+        (Join-Path $PSScriptRoot 'target\release\narrowd.exe'),
+        (Join-Path $PSScriptRoot 'target\debug\narrowd.exe'),
+        (Join-Path $PSScriptRoot 'narrowd.exe')
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    $command = Get-Command narrowd.exe -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Path
+    }
+
+    return $candidates[0]
+}
+
+function Get-DefaultNarrowdRoot([string]$ProfileDir) {
+    if ([string]::IsNullOrWhiteSpace($ProfileDir)) {
+        throw "Profile directory cannot be empty."
+    }
+
+    return (Join-Path $ProfileDir 'AppData\Local\narrowd')
+}
+
+function Get-DefaultBinaryInstallDir([string]$ProfileDir) {
+    return (Join-Path (Get-DefaultNarrowdRoot $ProfileDir) 'bin')
+}
+
+function Prompt-WithDefault([string]$Prompt, [string]$Default) {
+    $response = Read-Host "$Prompt [$Default]"
+    if ([string]::IsNullOrWhiteSpace($response)) {
+        return $Default
+    }
+
+    return $response.Trim()
+}
+
+function Prompt-IntWithDefault(
+    [string]$Prompt,
+    [int]$Default,
+    [int]$Minimum,
+    [int]$Maximum
+) {
+    while ($true) {
+        $response = Read-Host "$Prompt [$Default]"
+        if ([string]::IsNullOrWhiteSpace($response)) {
+            return $Default
+        }
+
+        $value = 0
+        if ([int]::TryParse($response.Trim(), [ref]$value) -and
+            $value -ge $Minimum -and
+            $value -le $Maximum) {
+            return $value
+        }
+
+        Warn "Enter a number between $Minimum and $Maximum."
+    }
+}
+
+function Prompt-YesNoWithDefault([string]$Prompt, [bool]$Default) {
+    $hint = if ($Default) { 'Y/n' } else { 'y/N' }
+
+    while ($true) {
+        $response = Read-Host "$Prompt [$hint]"
+        if ([string]::IsNullOrWhiteSpace($response)) {
+            return $Default
+        }
+
+        switch ($response.Trim().ToLowerInvariant()) {
+            'y' { return $true }
+            'yes' { return $true }
+            'n' { return $false }
+            'no' { return $false }
+            default { Warn "Enter yes or no." }
+        }
+    }
+}
 
 function Quote-ServiceCommandArg([string]$Value) {
     if ($Value -eq '') { return '""' }
@@ -118,6 +243,86 @@ function Build-ServiceBinaryPath([string]$ExePath, [string]$ConfigPath, [string]
         '--log-file'
         (Quote-ServiceCommandArg $LogPath)
     ) -join ' '
+}
+
+function Install-ServiceBinary([string]$SourcePath, [string]$DestinationDir) {
+    $DestinationDir = [Environment]::ExpandEnvironmentVariables($DestinationDir)
+    if ([string]::IsNullOrWhiteSpace($DestinationDir)) {
+        throw "Binary install directory cannot be empty."
+    }
+
+    if (-not (Test-Path $DestinationDir)) {
+        New-Item -ItemType Directory -Path $DestinationDir -Force | Out-Null
+        OK "Created $DestinationDir"
+    }
+
+    $destinationPath = Join-Path $DestinationDir (Split-Path $SourcePath -Leaf)
+    $sourceFullPath = [System.IO.Path]::GetFullPath($SourcePath)
+    $destinationFullPath = [System.IO.Path]::GetFullPath($destinationPath)
+
+    if ($sourceFullPath.Equals($destinationFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $sourceFullPath
+    }
+
+    Copy-Item -LiteralPath $sourceFullPath -Destination $destinationFullPath -Force
+    return $destinationFullPath
+}
+
+function Read-BigEndianUInt32([byte[]]$Bytes, [ref]$Offset) {
+    if (($Offset.Value + 4) -gt $Bytes.Length) {
+        throw "unexpected end of OpenSSH key data"
+    }
+
+    $value =
+        ($Bytes[$Offset.Value] -shl 24) -bor
+        ($Bytes[$Offset.Value + 1] -shl 16) -bor
+        ($Bytes[$Offset.Value + 2] -shl 8) -bor
+        $Bytes[$Offset.Value + 3]
+    $Offset.Value += 4
+    return [uint32]$value
+}
+
+function Read-OpenSshString([byte[]]$Bytes, [ref]$Offset) {
+    $length = [int](Read-BigEndianUInt32 $Bytes $Offset)
+    if (($Offset.Value + $length) -gt $Bytes.Length) {
+        throw "unexpected end of OpenSSH key data"
+    }
+
+    $value = [System.Text.Encoding]::ASCII.GetString($Bytes, $Offset.Value, $length)
+    $Offset.Value += $length
+    return $value
+}
+
+function Get-OpenSshPrivateKeyCipherName([string]$Path) {
+    try {
+        $lines = Get-Content -LiteralPath $Path -ErrorAction Stop
+        if (-not $lines -or $lines[0] -ne '-----BEGIN OPENSSH PRIVATE KEY-----') {
+            return $null
+        }
+
+        $base64 = ($lines | Where-Object { $_ -notmatch '^-----' }) -join ''
+        $bytes = [Convert]::FromBase64String($base64)
+        $magic = [System.Text.Encoding]::ASCII.GetString($bytes, 0, 15)
+        if ($magic -ne "openssh-key-v1`0") {
+            return $null
+        }
+
+        $offset = 15
+        return Read-OpenSshString $bytes ([ref]$offset)
+    } catch {
+        return $null
+    }
+}
+
+function Assert-UnencryptedHostKey([string]$Path) {
+    $cipherName = Get-OpenSshPrivateKeyCipherName $Path
+    if ($cipherName -and $cipherName -ne 'none') {
+        throw (
+            "Host key '$Path' is encrypted (cipher '$cipherName'). " +
+            "narrowd requires an unencrypted host key. " +
+            "If this file was created by an older installer run, rerun Install-Narrowd.ps1 with -Force to regenerate it."
+        )
+    }
 }
 
 function Remove-ExistingService([string]$Name) {
@@ -237,22 +442,73 @@ public static class NarrowdLsa {
     [NarrowdLsa]::AddRight($Account, 'SeServiceLogonRight')
 }
 
+$defaultUserName = Get-DefaultUserName
+$defaultBinaryPath = Get-DefaultBinaryPath
+if (-not $PSBoundParameters.ContainsKey('UserName')) {
+    $UserName = Prompt-WithDefault 'Windows account for the service' $defaultUserName
+}
+
+if (-not $PSBoundParameters.ContainsKey('BinaryPath')) {
+    $BinaryPath = Prompt-WithDefault 'Path to narrowd.exe' $defaultBinaryPath
+}
+
+if (-not $PSBoundParameters.ContainsKey('Port')) {
+    $Port = Prompt-IntWithDefault 'TCP port to listen on' 2222 1 65535
+}
+
+if (-not $PSBoundParameters.ContainsKey('ServiceName')) {
+    $ServiceName = Prompt-WithDefault 'Windows service name' 'narrowd'
+}
+
+if (-not $PSBoundParameters.ContainsKey('NoBinaryCopy')) {
+    $NoBinaryCopy = -not (Prompt-YesNoWithDefault 'Copy narrowd.exe to a stable install directory?' $true)
+}
+
+if (-not $PSBoundParameters.ContainsKey('Force')) {
+    $Force = Prompt-YesNoWithDefault 'Reinstall existing service if present?' $false
+}
+
+if (-not $PSBoundParameters.ContainsKey('NoFirewall')) {
+    $NoFirewall = Prompt-YesNoWithDefault 'Skip creating the inbound firewall rule?' $false
+}
+
 Step "Validating"
+$BinaryPath = [Environment]::ExpandEnvironmentVariables($BinaryPath)
+if (-not (Test-Path $BinaryPath)) {
+    throw (
+        "Cannot find narrowd.exe at '$BinaryPath'. " +
+        "Build it with 'cargo build --release' or pass -BinaryPath explicitly."
+    )
+}
+
 $BinaryPath = (Resolve-Path $BinaryPath -ErrorAction Stop).Path
+OK "UserName: $UserName"
 OK "Binary: $BinaryPath"
+OK "Port: $Port"
+OK "Service name: $ServiceName"
 
 $accountFqn = if ($UserName -match '\\') { $UserName } else { ".\$UserName" }
 
 Step "Resolving profile for '$UserName'"
 $profileDir = Resolve-ProfilePath $UserName
-$appdataDir = Join-Path $profileDir 'AppData\Roaming'
-$narrowdDir = Join-Path $appdataDir 'narrowd'
+$narrowdDir = Get-DefaultNarrowdRoot $profileDir
 $configFile = Join-Path $narrowdDir 'narrowd.conf'
 $hostKeyFile = Join-Path $narrowdDir 'ssh_host_ed25519_key'
 $authKeysFile = Join-Path $profileDir '.ssh\authorized_keys'
 $logDir = Join-Path $narrowdDir 'logs'
 $serviceLogFile = Join-Path $logDir 'narrowd.log'
 OK "Profile: $profileDir"
+OK "Data directory: $narrowdDir"
+
+if (-not $NoBinaryCopy) {
+    if (-not $PSBoundParameters.ContainsKey('BinaryInstallDir')) {
+        $BinaryInstallDir = Prompt-WithDefault 'Binary install directory' (Get-DefaultBinaryInstallDir $profileDir)
+    }
+    $BinaryInstallDir = [Environment]::ExpandEnvironmentVariables($BinaryInstallDir)
+    OK "Binary install directory: $BinaryInstallDir"
+} else {
+    OK "Binary copy: disabled"
+}
 
 Step "Creating directories"
 foreach ($dir in @($narrowdDir, $logDir, (Split-Path $authKeysFile -Parent))) {
@@ -264,6 +520,7 @@ foreach ($dir in @($narrowdDir, $logDir, (Split-Path $authKeysFile -Parent))) {
 
 Step "SSH host key"
 if ((Test-Path $hostKeyFile) -and -not $Force) {
+    Assert-UnencryptedHostKey $hostKeyFile
     OK "Already exists - skipping (use -Force to regenerate)"
 } else {
     $keygen = Get-Command ssh-keygen -ErrorAction SilentlyContinue
@@ -275,9 +532,9 @@ if ((Test-Path $hostKeyFile) -and -not $Force) {
     }
 
     Remove-Item "$hostKeyFile", "$hostKeyFile.pub" -Force -ErrorAction SilentlyContinue
-
-    & ssh-keygen -t ed25519 -f $hostKeyFile -N "" -q
+    & ssh-keygen -t ed25519 -f $hostKeyFile -N '""' -q
     if ($LASTEXITCODE -ne 0) { throw "ssh-keygen failed (exit $LASTEXITCODE)" }
+    Assert-UnencryptedHostKey $hostKeyFile
     OK $hostKeyFile
 }
 
@@ -381,11 +638,6 @@ $credential = Get-Credential -UserName $accountFqn `
     -Message "Enter the Windows password for '$accountFqn' (stored by Windows for the service logon):"
 
 Step "Installing service '$ServiceName'"
-$serviceBinaryPath = Build-ServiceBinaryPath `
-    -ExePath $BinaryPath `
-    -ConfigPath $configFile `
-    -Name $ServiceName `
-    -LogPath $serviceLogFile
 $existing = Get-Service $ServiceName -ErrorAction SilentlyContinue
 if ($existing) {
     if (-not $Force) {
@@ -394,6 +646,21 @@ if ($existing) {
     Write-Host "    Removing existing service..."
     Remove-ExistingService $ServiceName
 }
+
+$serviceExePath = $BinaryPath
+if (-not $NoBinaryCopy) {
+    Step "Deploying binary"
+    $serviceExePath = Install-ServiceBinary `
+        -SourcePath $BinaryPath `
+        -DestinationDir $BinaryInstallDir
+    OK "Service binary: $serviceExePath"
+}
+
+$serviceBinaryPath = Build-ServiceBinaryPath `
+    -ExePath $serviceExePath `
+    -ConfigPath $configFile `
+    -Name $ServiceName `
+    -LogPath $serviceLogFile
 
 New-Service `
     -Name $ServiceName `
@@ -439,6 +706,7 @@ Write-Host $bar -ForegroundColor Green
 Write-Host ""
 Write-Host ("  Service name : " + $ServiceName)
 Write-Host ("  Runs as      : " + $accountFqn)
+Write-Host ("  Service exe  : " + $serviceExePath)
 Write-Host ("  Listen port  : " + $Port)
 Write-Host ("  Config       : " + $configFile)
 Write-Host ("  Host key     : " + $hostKeyFile)
