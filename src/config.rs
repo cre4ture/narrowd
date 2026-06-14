@@ -233,7 +233,7 @@ impl AppConfig {
                     self.authorized_keys_file = resolve_config_path(&values.join(" "), base_dir)?;
                 }
                 "shell" => {
-                    self.shell = resolve_config_path(&values.join(" "), base_dir)?;
+                    self.shell = resolve_shell_command_or_path(&values.join(" "), base_dir)?;
                 }
                 "permittty" => {
                     self.permit_tty = parse_bool(values[0])
@@ -502,6 +502,19 @@ fn resolve_config_path(input: &str, base_dir: &Path) -> Result<PathBuf> {
     }
 }
 
+fn resolve_shell_command_or_path(input: &str, base_dir: &Path) -> Result<PathBuf> {
+    let path = expand_home(PathBuf::from(input))?;
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
+    if path.components().nth(1).is_none() {
+        return Ok(path);
+    }
+
+    Ok(base_dir.join(path))
+}
+
 fn expand_home(path: PathBuf) -> Result<PathBuf> {
     let text = path.to_string_lossy();
     if text == "~" || text.starts_with("~/") {
@@ -590,5 +603,25 @@ mod tests {
     fn packaged_example_matches_sample_config() {
         let packaged_example = include_str!("../narrowd.conf.example");
         assert_eq!(packaged_example.replace("\r\n", "\n"), SAMPLE_CONFIG);
+    }
+
+    #[test]
+    fn shell_directive_keeps_bare_command_name() {
+        let mut config = AppConfig::defaults().unwrap();
+        config
+            .apply_text("Shell powershell.exe\n", Path::new("/tmp"))
+            .unwrap();
+
+        assert_eq!(config.shell, PathBuf::from("powershell.exe"));
+    }
+
+    #[test]
+    fn shell_directive_resolves_relative_path_from_config_dir() {
+        let mut config = AppConfig::defaults().unwrap();
+        config
+            .apply_text("Shell bin/custom-shell.exe\n", Path::new("/tmp"))
+            .unwrap();
+
+        assert_eq!(config.shell, Path::new("/tmp").join("bin/custom-shell.exe"));
     }
 }

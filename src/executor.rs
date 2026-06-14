@@ -1218,6 +1218,7 @@ where
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<ProcessOutput>();
     let (exit_tx, mut exit_rx) = oneshot::channel::<u32>();
     let (control_tx, control_rx) = std_mpsc::channel::<PtyControl>();
+    let control_close_tx = control_tx.clone();
 
     thread::spawn(move || run_pty_reader(launch.reader, output_tx));
     thread::spawn(move || {
@@ -1239,14 +1240,20 @@ where
     });
 
     tokio::spawn(async move {
-        let input_task = tokio::spawn(async move {
+        let mut input_task = Some(tokio::spawn(async move {
             let _ = handle_pty_service_input(&mut stream_read, control_tx).await;
-        });
+        }));
 
         let mut child_exit = None;
         let mut output_closed = false;
 
         loop {
+            #[cfg(windows)]
+            if child_exit.is_some() {
+                break;
+            }
+
+            #[cfg(not(windows))]
             if output_closed && child_exit.is_some() {
                 break;
             }
@@ -1264,6 +1271,14 @@ where
                 }
                 result = &mut exit_rx, if child_exit.is_none() => {
                     child_exit = Some(result.unwrap_or(255));
+                    // Windows pseudocon output can stay open after the shell exits.
+                    // Closing the PTY control side here lets the reader unwind so
+                    // the SSH session can deliver exit-status/close promptly.
+                    let _ = control_close_tx.send(PtyControl::Close);
+                    if let Some(task) = input_task.take() {
+                        task.abort();
+                        let _ = task.await;
+                    }
                 }
             }
         }
@@ -1272,8 +1287,10 @@ where
             let _ = send_session_message(&mut stream_write, &ProcessOutput::ExitStatus(code)).await;
         }
         let _ = stream_write.shutdown().await;
-        input_task.abort();
-        let _ = input_task.await;
+        if let Some(task) = input_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
     });
 
     Ok(())
@@ -1825,5 +1842,91 @@ mod tests {
     fn rejects_child_pids_that_do_not_fit_i32() {
         let err = send_signal_to_pid(i32::MAX as u32 + 1, Signal::SIGTERM).unwrap_err();
         assert!(err.to_string().contains("child pid too large"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use tokio::time::{Duration, timeout};
+
+    fn windows_whoami_path() -> PathBuf {
+        if let Ok(system_root) = std::env::var("SystemRoot") {
+            let path = PathBuf::from(system_root).join("System32\\whoami.exe");
+            if path.exists() {
+                return path;
+            }
+        }
+
+        PathBuf::from("whoami.exe")
+    }
+
+    #[tokio::test]
+    async fn pty_process_exit_reports_status_and_closes_stream() {
+        let (mut client_stream, service_stream) = tokio::io::duplex(MAX_SESSION_MESSAGE_SIZE);
+        let hello = ExecutorHello {
+            home_dir: dirs::home_dir().unwrap(),
+            shell: windows_whoami_path(),
+        };
+        let request = ProcessRequest {
+            pty: Some(SerializablePtyRequest {
+                term: "xterm-256color".to_string(),
+                size: SerializablePtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }),
+            env: BTreeMap::new(),
+            command: None,
+        };
+
+        start_pty_process_service(hello, request, service_stream)
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut outputs = Vec::new();
+        let mut saw_eof = false;
+
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match timeout(
+                remaining.min(Duration::from_secs(2)),
+                read_session_message::<_, ProcessOutput>(&mut client_stream),
+            )
+            .await
+            {
+                Ok(Ok(Some(message))) => {
+                    if let ProcessOutput::Stdout(data) = &message
+                        && data.windows(4).any(|window| window == b"\x1b[6n")
+                    {
+                        send_session_message(
+                            &mut client_stream,
+                            &ProcessInput::Data(b"\x1b[1;1R".to_vec()),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    outputs.push(message);
+                }
+                Ok(Ok(None)) => {
+                    saw_eof = true;
+                    break;
+                }
+                Ok(Err(err)) => panic!("failed to read PTY process output: {err:#}"),
+                Err(_) => continue,
+            }
+        }
+
+        assert!(saw_eof, "PTY process did not close the service stream after exit; received outputs: {outputs:?}");
+
+        assert!(
+            outputs
+                .iter()
+                .any(|message| matches!(message, ProcessOutput::ExitStatus(0))),
+            "expected PTY process to report exit status 0, got {outputs:?}"
+        );
     }
 }

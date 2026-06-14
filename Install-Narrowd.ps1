@@ -144,6 +144,22 @@ function Get-DefaultBinaryInstallDir([string]$ProfileDir) {
     return (Join-Path (Get-DefaultNarrowdRoot $ProfileDir) 'bin')
 }
 
+function Get-DefaultShellPath() {
+    $command = Get-Command powershell.exe -ErrorAction SilentlyContinue
+    if ($command -and $command.Path) {
+        return $command.Path
+    }
+
+    if ($env:SystemRoot) {
+        $candidate = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (Test-Path $candidate) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    return 'powershell.exe'
+}
+
 function Prompt-WithDefault([string]$Prompt, [string]$Default) {
     $response = Read-Host "$Prompt [$Default]"
     if ([string]::IsNullOrWhiteSpace($response)) {
@@ -562,6 +578,7 @@ if ((Test-Path $configFile) -and -not $Force) {
 } else {
     $hk = $hostKeyFile -replace '\\', '/'
     $ak = $authKeysFile -replace '\\', '/'
+    $shellPath = (Get-DefaultShellPath) -replace '\\', '/'
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $configContent = (
         @(
@@ -575,7 +592,7 @@ if ((Test-Path $configFile) -and -not $Force) {
             "HostKey $hk"
             "AuthorizedKeysFile $ak"
             ''
-            'Shell powershell.exe'
+            "Shell $shellPath"
             'PermitTTY yes'
             'PermitExec yes'
             ''
