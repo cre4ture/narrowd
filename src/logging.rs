@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use narrowd::config;
+use crate::config;
 
 const DEFAULT_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 

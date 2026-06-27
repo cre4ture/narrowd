@@ -105,27 +105,36 @@ process. The packaged user service intentionally does not use
 forces `NoNewPrivs=1` onto the whole service tree and would break post-auth
 tools such as `sudo`.
 
-Windows service install:
+Windows MSIX user-session install:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build-NarrowdMsix.ps1
+powershell -ExecutionPolicy Bypass -File .\Install-NarrowdMsix.ps1
+```
+
+The MSIX build produces a signed package and companion certificate under
+`target\msix`. Installing it registers a per-user startup task, so `narrowd`
+starts automatically in the signed-in user's own session after the next
+logon instead of running in Session 0 as a machine service. The package keeps
+its config, host key, and logs under `%LOCALAPPDATA%\narrowd`, and the first
+launch writes a default config that points `AuthorizedKeysFile` at
+`%USERPROFILE%\.ssh\authorized_keys`, uses `ExecMode powershell`, and listens
+on TCP `2223` by default.
+
+The packaged manifest also declares the default inbound TCP `2223` firewall
+rule. If you later change the port in `%LOCALAPPDATA%\narrowd\narrowd.conf`,
+adjust the firewall rule manually so it matches the new port.
+
+Legacy Windows service install (administrator, Session 0):
 
 ```powershell
 cargo build --release
 powershell -ExecutionPolicy Bypass -File .\Install-Narrowd.ps1
 ```
 
-The installer prompts for any missing values and shows defaults for the
-current Windows account, the local `narrowd.exe` build output, port `2222`,
-service name `narrowd`, a stable binary install directory under
-`%LOCALAPPDATA%\narrowd\bin`, and the firewall/reinstall/copy choices. By
-default it copies `narrowd.exe` there so the service keeps working even if you
-delete or change the repo checkout later.
-
-The Windows installer uses `narrowd`'s built-in native service mode, so no
-external wrapper such as NSSM is required. It writes the service config,
-machine-local host key, and logs under `%LOCALAPPDATA%\narrowd`, which is a
-better fit than `%APPDATA%` because these artifacts should stay local to the
-machine rather than roam with the user's profile. The generated Windows config
-also sets `ExecMode powershell` so SSH `exec` requests remain compatible with
-the default PowerShell shell.
+That older installer still exists when you explicitly want a native Windows
+service with `Log on as a service`, but the MSIX route is the better fit for a
+user-session daemon that should come up automatically when the user logs in.
 
 RDP over SSH tunnel:
 

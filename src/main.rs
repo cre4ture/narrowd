@@ -6,11 +6,11 @@ use clap::Parser;
 use narrowd::config::{AppConfig, SAMPLE_CONFIG};
 #[cfg(unix)]
 use narrowd::executor;
+use narrowd::logging;
 #[cfg(unix)]
 use narrowd::sandbox;
 use narrowd::sshd;
 
-mod logging;
 #[cfg(windows)]
 mod windows_service_runtime;
 
