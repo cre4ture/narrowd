@@ -112,6 +112,11 @@ powershell -ExecutionPolicy Bypass -File .\Build-NarrowdMsix.ps1
 powershell -ExecutionPolicy Bypass -File .\Install-NarrowdMsix.ps1
 ```
 
+For the purpose of the MSIX mode, how it differs from the Session 0 service,
+and how automatic Windows logon fits in when you want the user session to come
+up on its own after boot, see
+[`docs/windows-session-modes.md`](docs/windows-session-modes.md).
+
 The MSIX build produces a signed package and companion certificate under
 `target\msix`. Installing it registers a per-user startup task, so `narrowd`
 starts automatically in the signed-in user's own session after the next
@@ -131,6 +136,9 @@ Legacy Windows service install (administrator, Session 0):
 cargo build --release
 powershell -ExecutionPolicy Bypass -File .\Install-Narrowd.ps1
 ```
+
+See [`docs/windows-session-modes.md`](docs/windows-session-modes.md) for when
+to choose this Session 0 service versus the MSIX user-session mode.
 
 That older installer still exists when you explicitly want a native Windows
 service with `Log on as a service`, but the MSIX route is the better fit for a
