@@ -11,8 +11,13 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 const MAX_SFTP_READ_LEN: u32 = 1 << 20;
 
 enum HandleState {
-    File { file: TokioFile },
-    Dir { path: PathBuf, entries: ReadDir },
+    File {
+        file: TokioFile,
+    },
+    Dir {
+        path: PathBuf,
+        entries: Box<ReadDir>,
+    },
 }
 
 pub struct LocalSftp {
@@ -180,7 +185,7 @@ impl russh_sftp::server::Handler for LocalSftp {
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         let path = self.resolve_path(&path);
-        let entries = fs::read_dir(&path).await.map_err(io_error_to_status)?;
+        let entries = Box::new(fs::read_dir(&path).await.map_err(io_error_to_status)?);
         let handle = self.make_handle();
         self.handles
             .insert(handle.clone(), HandleState::Dir { path, entries });
@@ -279,7 +284,7 @@ impl russh_sftp::server::Handler for LocalSftp {
 
     async fn symlink(
         &mut self,
-        id: u32,
+        _id: u32,
         linkpath: String,
         targetpath: String,
     ) -> Result<Status, Self::Error> {
@@ -287,15 +292,16 @@ impl russh_sftp::server::Handler for LocalSftp {
         let targetpath = self.resolve_path(&targetpath);
 
         #[cfg(unix)]
-        std::os::unix::fs::symlink(targetpath, linkpath).map_err(io_error_to_status)?;
+        {
+            std::os::unix::fs::symlink(targetpath, linkpath).map_err(io_error_to_status)?;
+            Ok(Self::ok_status(_id))
+        }
 
         #[cfg(not(unix))]
         {
             let _ = (linkpath, targetpath);
-            return Err(StatusCode::OpUnsupported.into());
+            Err(StatusCode::OpUnsupported.into())
         }
-
-        Ok(Self::ok_status(id))
     }
 }
 

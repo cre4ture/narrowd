@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command as StdCommand, Stdio};
@@ -181,9 +183,14 @@ async fn exec_requests_run_through_executor_process() -> Result<()> {
     })?;
     let (addr, task) = spawn_server(config).await?;
 
-    let result = exec_with_key(addr, Arc::clone(&client_key), "printf 'executor-ok\\n'").await?;
+    let (command, expected_stdout) = if cfg!(windows) {
+        ("cmd /c echo executor-ok", "executor-ok\r\n")
+    } else {
+        ("printf 'executor-ok\\n'", "executor-ok\n")
+    };
+    let result = exec_with_key(addr, Arc::clone(&client_key), command).await?;
     assert_eq!(result.exit_status, 0);
-    assert_eq!(result.stdout, "executor-ok\n");
+    assert_eq!(result.stdout, expected_stdout);
     assert!(result.stderr.is_empty());
 
     task.abort();
@@ -785,6 +792,7 @@ ListenAddress 127.0.0.1
 HostKey {}
 AuthorizedKeysFile {}
 Shell /bin/bash
+ExecMode shell-login
 PermitTTY yes
 PermitExec yes
 SftpEnabled yes

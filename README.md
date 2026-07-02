@@ -9,7 +9,7 @@ Current feature surface:
 
 - public-key auth against one `authorized_keys` file
 - interactive shell as the daemon process user
-- `exec` requests via `bash -lc`
+- `exec` requests via the configured shell wrapper (`ExecMode`)
 - SFTP subsystem backed by the local filesystem
 - local and remote TCP forwarding
 
@@ -69,7 +69,7 @@ For a concrete checklist of public-internet hardening work under the
 CI / repository automation:
 
 - GitHub Actions covers formatting, clippy, rustdoc with warnings denied, Linux tests on stable and beta, a macOS build check, and a Debian package smoke test.
-- Security automation also includes `cargo audit`, CodeQL analysis, and GitHub dependency review on pull requests.
+- Security automation also includes `cargo audit`, CodeQL analysis, and GitHub dependency review on pull requests when the repository dependency graph is enabled.
 - The committed `cargo audit` policy intentionally ignores `RUSTSEC-2023-0071` only because `narrowd`'s public-exposure profile rejects RSA host and user keys entirely. If RSA support is ever added, that exception should be removed and reevaluated immediately.
 
 Quick start:
@@ -104,6 +104,45 @@ process. The packaged user service intentionally does not use
 `RestrictAddressFamilies=` because systemd applies that with seccomp, which
 forces `NoNewPrivs=1` onto the whole service tree and would break post-auth
 tools such as `sudo`.
+
+Windows MSIX user-session install:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build-NarrowdMsix.ps1
+powershell -ExecutionPolicy Bypass -File .\Install-NarrowdMsix.ps1
+```
+
+For the purpose of the MSIX mode, how it differs from the Session 0 service,
+and how automatic Windows logon fits in when you want the user session to come
+up on its own after boot, see
+[`docs/windows-session-modes.md`](docs/windows-session-modes.md).
+
+The MSIX build produces a signed package and companion certificate under
+`target\msix`. Installing it registers a per-user startup task, so `narrowd`
+starts automatically in the signed-in user's own session after the next
+logon instead of running in Session 0 as a machine service. The package keeps
+its config, host key, and logs under `%LOCALAPPDATA%\narrowd`, and the first
+launch writes a default config that points `AuthorizedKeysFile` at
+`%USERPROFILE%\.ssh\authorized_keys`, uses `ExecMode powershell`, and listens
+on TCP `2223` by default.
+
+The packaged manifest also declares the default inbound TCP `2223` firewall
+rule. If you later change the port in `%LOCALAPPDATA%\narrowd\narrowd.conf`,
+adjust the firewall rule manually so it matches the new port.
+
+Legacy Windows service install (administrator, Session 0):
+
+```powershell
+cargo build --release
+powershell -ExecutionPolicy Bypass -File .\Install-Narrowd.ps1
+```
+
+See [`docs/windows-session-modes.md`](docs/windows-session-modes.md) for when
+to choose this Session 0 service versus the MSIX user-session mode.
+
+That older installer still exists when you explicitly want a native Windows
+service with `Log on as a service`, but the MSIX route is the better fit for a
+user-session daemon that should come up automatically when the user logs in.
 
 RDP over SSH tunnel:
 
