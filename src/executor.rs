@@ -1353,6 +1353,8 @@ where
     let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
     let input_kill_tx = kill_tx.clone();
     let outer_kill_tx = kill_tx;
+    #[cfg(unix)]
+    let _ = &outer_kill_tx;
 
     tokio::spawn(read_process_stream(
         stdout,
@@ -1466,6 +1468,9 @@ async fn handle_piped_service_input<R>(
 where
     R: AsyncRead + Unpin,
 {
+    #[cfg(unix)]
+    let _ = &kill_tx;
+
     while let Some(message) = read_session_message(reader).await? {
         match message {
             ProcessInput::Data(data) => {
@@ -1533,33 +1538,30 @@ where
     Ok(())
 }
 
-fn read_process_stream<R>(
+async fn read_process_stream<R>(
     mut stream: R,
     which: ProcessStream,
     output_tx: mpsc::UnboundedSender<ProcessOutput>,
-) -> impl std::future::Future<Output = ()> + Send + 'static
-where
+) where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    async move {
-        let mut buffer = vec![0_u8; 8192];
-        loop {
-            match stream.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(read) => {
-                    let chunk = buffer[..read].to_vec();
-                    let message = match which {
-                        ProcessStream::Stdout => ProcessOutput::Stdout(chunk),
-                        ProcessStream::Stderr => ProcessOutput::Stderr(chunk),
-                    };
-                    if output_tx.send(message).is_err() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    debug!("process stream read ended: {err}");
+    let mut buffer = vec![0_u8; 8192];
+    loop {
+        match stream.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let chunk = buffer[..read].to_vec();
+                let message = match which {
+                    ProcessStream::Stdout => ProcessOutput::Stdout(chunk),
+                    ProcessStream::Stderr => ProcessOutput::Stderr(chunk),
+                };
+                if output_tx.send(message).is_err() {
                     break;
                 }
+            }
+            Err(err) => {
+                debug!("process stream read ended: {err}");
+                break;
             }
         }
     }
