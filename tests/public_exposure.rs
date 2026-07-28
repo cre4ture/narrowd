@@ -1,4 +1,5 @@
 #![cfg(unix)]
+#![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt;
