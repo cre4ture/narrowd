@@ -80,6 +80,16 @@ controlled pre-authentication surface, while OpenSSH offers a far broader
 policy and compatibility surface backed by decades of audit and operational
 history.
 
+`narrowd` also benefits from Rust's safety model. OpenSSH is primarily
+implemented in C; in safe Rust, ownership and the type system rule out broad
+classes of use-after-free, double-free, and data-race bugs at compile time,
+while bounds checks prevent out-of-range indexing from becoming unchecked
+memory corruption. These guarantees reduce the memory-corruption surface of a
+network-facing daemon without relying on review alone. Rust is not a security
+guarantee: `unsafe` code, native dependencies, protocol mistakes, and logic
+flaws still require careful review. It does, however, give `narrowd` a strong
+implementation-level safety baseline.
+
 Choose `narrowd` when its trusted-key, single-user model matches the deployment.
 Choose OpenSSH when you need multi-user administration, per-key restrictions,
 legacy compatibility, or an implementation mandated by policy or compliance.
