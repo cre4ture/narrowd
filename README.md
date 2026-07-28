@@ -107,7 +107,9 @@ under the "attacker has no stolen key" assumption, see
 
 ## Quality and security checks
 
-- GitHub Actions covers formatting, clippy, rustdoc with warnings denied, Linux tests on stable and beta, a macOS build check, and a Debian package smoke test.
+- GitHub Actions covers formatting, clippy, rustdoc with warnings denied, Linux
+  tests on stable and beta, Windows tests on stable, a macOS build check, and a
+  Debian package smoke test.
 - Security automation also includes `cargo audit`, CodeQL analysis, and GitHub dependency review on pull requests when the repository dependency graph is enabled.
 - The committed `cargo audit` policy intentionally ignores `RUSTSEC-2023-0071` only because `narrowd`'s public-exposure profile rejects RSA host and user keys entirely. If RSA support is ever added, that exception should be removed and reevaluated immediately.
 
