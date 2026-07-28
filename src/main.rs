@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -48,11 +50,6 @@ struct Cli {
     #[arg(long, hide = true)]
     internal_executor: bool,
 
-    /// Control fd inherited by the internal executor process (Unix only).
-    #[cfg(unix)]
-    #[arg(long, hide = true)]
-    control_fd: Option<i32>,
-
     /// Internal pre-auth sandbox probe mode (Unix only).
     #[cfg(unix)]
     #[arg(long, hide = true)]
@@ -92,10 +89,7 @@ fn main() -> Result<()> {
 async fn run_cli(cli: Cli) -> Result<()> {
     #[cfg(unix)]
     if cli.internal_executor {
-        let control_fd = cli
-            .control_fd
-            .context("missing --control-fd for --internal-executor mode")?;
-        return executor::run_from_control_fd(control_fd).await;
+        return executor::run_from_control_stdin().await;
     }
 
     #[cfg(unix)]

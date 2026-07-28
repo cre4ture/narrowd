@@ -1,4 +1,5 @@
 #![cfg(unix)]
+#![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt;
@@ -271,6 +272,7 @@ fn internal_preauth_sandbox_probe_blocks_writes_and_exec() -> Result<()> {
     assert_eq!(parse_probe_flag(&stdout, "read_ok"), Some(1));
     assert_eq!(parse_probe_flag(&stdout, "write_denied"), Some(1));
     assert_eq!(parse_probe_flag(&stdout, "exec_denied"), Some(1));
+    assert_eq!(parse_probe_flag(&stdout, "socket_eperm"), Some(1));
     assert_eq!(parse_probe_flag(&stdout, "seccomp_mode"), Some(2));
     Ok(())
 }

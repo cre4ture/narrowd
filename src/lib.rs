@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod admission;
 mod authorized_keys;
 pub mod executor;
