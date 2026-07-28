@@ -853,8 +853,9 @@ impl server::Handler for ClientHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         info!(
             "opened session channel {:?} from {}",
             channel.id(),
@@ -868,7 +869,8 @@ impl server::Handler for ClientHandler {
                 env: BTreeMap::new(),
             },
         );
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn channel_open_direct_tcpip(
@@ -878,16 +880,23 @@ impl server::Handler for ClientHandler {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         if !self.state.config.allow_tcp_forwarding {
             warn!("direct-tcpip denied by config");
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         }
 
         let Some(port) = u16::try_from(port_to_connect).ok() else {
             warn!("direct-tcpip denied due to invalid target port {port_to_connect}");
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         };
 
         match self
@@ -905,19 +914,21 @@ impl server::Handler for ClientHandler {
                     originator_port,
                     channel.id()
                 );
+                reply.accept().await;
                 tokio::spawn(async move {
                     if let Err(err) = proxy_stream(channel.into_stream(), stream).await {
                         debug!("direct-tcpip proxy ended: {err:#}");
                     }
                 });
-                Ok(true)
+                Ok(())
             }
             Err(err) => {
                 warn!(
                     "direct-tcpip connect {}:{} failed: {err:#}",
                     host_to_connect, port_to_connect
                 );
-                Ok(false)
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                Ok(())
             }
         }
     }
@@ -1613,22 +1624,11 @@ mod tests {
     }
 
     #[test]
-    fn rustsec_rsa_suppression_requires_rsa_support_to_stay_disabled() {
-        let audit_config = include_str!("../.cargo/audit.toml");
-        if !audit_config.contains("RUSTSEC-2023-0071") {
-            return;
-        }
-
-        assert!(!is_user_key_algorithm_allowed(&ssh_key::Algorithm::Rsa {
-            hash: None
-        }));
-
-        let preferred = public_exposure_preferred();
+    fn rsa_dependency_stays_absent() {
+        let lockfile = include_str!("../Cargo.lock");
         assert!(
-            preferred
-                .key
-                .iter()
-                .all(|algorithm| !matches!(algorithm, ssh_key::Algorithm::Rsa { .. }))
+            !lockfile.contains("[[package]]\nname = \"rsa\"\n"),
+            "the vulnerable RSA crate must not re-enter the dependency graph"
         );
     }
 

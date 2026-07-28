@@ -1,7 +1,0 @@
-[advisories]
-# `russh` currently pulls in `rsa` transitively, but narrowd's public-exposure
-# profile accepts only Ed25519-family host and user keys. If RSA support is ever
-# added intentionally, remove this ignore and reassess the dependency tree.
-ignore = [
-    "RUSTSEC-2023-0071",
-]

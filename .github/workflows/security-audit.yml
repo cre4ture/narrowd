@@ -21,10 +21,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  cargo-audit:
-    name: cargo-audit
+  dependency-policy:
+    name: Dependency policy
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -37,11 +37,16 @@ jobs:
         with:
           cache-bin: true
 
-      - name: Assert RSA stays disabled while RustSec suppression is present
-        run: cargo test --locked --lib rustsec_rsa_suppression_requires_rsa_support_to_stay_disabled
+      - name: Assert RSA dependency stays absent
+        run: cargo test --locked --lib rsa_dependency_stays_absent
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      - name: Install security tools
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
 
       - name: Run cargo-audit
         run: cargo audit --deny warnings
+
+      - name: Enforce dependency policy
+        run: cargo deny check bans licenses sources
