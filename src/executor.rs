@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(unix)]
@@ -12,11 +14,9 @@ use std::thread;
 #[cfg(unix)]
 use std::io::{IoSlice, IoSliceMut};
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow};
 use log::debug;
@@ -24,20 +24,17 @@ use log::debug;
 use log::warn;
 
 #[cfg(unix)]
-use nix::cmsg_space;
-#[cfg(unix)]
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-#[cfg(unix)]
-use nix::libc;
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill, killpg};
 #[cfg(unix)]
 use nix::sys::socket::{
-    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, recvmsg,
-    sendmsg, socketpair,
+    AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, sendmsg, socketpair,
 };
 #[cfg(unix)]
 use nix::unistd::{Pid, dup};
+#[cfg(unix)]
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, recvmsg};
 
 use portable_pty::{
     Child as PtyChild, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system,
@@ -64,8 +61,6 @@ pub type ServiceStream = tokio::net::UnixStream;
 #[cfg(not(unix))]
 pub type ServiceStream = tokio::io::DuplexStream;
 
-#[cfg(unix)]
-const CONTROL_FD: RawFd = 3;
 #[cfg(unix)]
 const MAX_CONTROL_MESSAGE_SIZE: usize = 64 * 1024;
 const MAX_SESSION_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -241,12 +236,17 @@ struct ExecutorState {
 // ─── Unix executor entry point (child process) ───────────────────────────────
 
 #[cfg(unix)]
-pub async fn run_from_control_fd(control_fd: RawFd) -> Result<()> {
-    let control_fd = unsafe { OwnedFd::from_raw_fd(control_fd) };
-    let read_fd = dup(&control_fd).context("failed to duplicate executor control fd for reads")?;
-    let write_fd =
-        dup(&control_fd).context("failed to duplicate executor control fd for writes")?;
-    drop(control_fd);
+pub async fn run_from_control_stdin() -> Result<()> {
+    let (read_fd, write_fd) = {
+        let stdin = std::io::stdin();
+        let read_fd =
+            dup(&stdin).context("failed to duplicate executor control stdin for reads")?;
+        let write_fd =
+            dup(&stdin).context("failed to duplicate executor control stdin for writes")?;
+        (read_fd, write_fd)
+    };
+    set_cloexec(&read_fd)?;
+    set_cloexec(&write_fd)?;
 
     let (request_tx, mut request_rx) =
         mpsc::unbounded_channel::<(ExecutorRequest, Option<OwnedFd>)>();
@@ -362,39 +362,23 @@ impl ExecutorClient {
         set_cloexec(&parent_fd)?;
         set_cloexec(&child_fd)?;
 
-        let child_raw_fd = child_fd.as_raw_fd();
         let mut command = StdCommand::new(executor_program(program_override)?);
         command.arg("--internal-executor");
-        command.arg("--control-fd");
-        command.arg(CONTROL_FD.to_string());
-        command.stdin(Stdio::null());
+        command.stdin(Stdio::from(child_fd));
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
-
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(child_raw_fd, CONTROL_FD) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-
-                if child_raw_fd != CONTROL_FD {
-                    libc::close(child_raw_fd);
-                }
-
-                Ok(())
-            });
-        }
 
         let child = command
             .spawn()
             .context("failed to spawn executor process")?;
-        drop(child_fd);
 
         let read_fd =
             dup(&parent_fd).context("failed to duplicate executor control fd for parent reads")?;
         let write_fd =
             dup(&parent_fd).context("failed to duplicate executor control fd for parent writes")?;
         drop(parent_fd);
+        set_cloexec(&read_fd)?;
+        set_cloexec(&write_fd)?;
 
         let mut reader = ControlReader { fd: read_fd };
         let mut writer = ControlWriter { fd: write_fd };
@@ -864,39 +848,40 @@ impl ControlReader {
         T: for<'de> Deserialize<'de>,
     {
         let mut buffer = vec![0_u8; MAX_CONTROL_MESSAGE_SIZE];
-        let mut cmsg_space = cmsg_space!([RawFd; 8]);
+        let mut cmsg_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
+        let mut ancillary = RecvAncillaryBuffer::new(&mut cmsg_space);
         let mut iov = [IoSliceMut::new(&mut buffer)];
-        let message = recvmsg::<()>(
-            self.fd.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg_space),
-            MsgFlags::empty(),
-        )
-        .context("failed to receive executor control message")?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let recv_flags = RecvFlags::CMSG_CLOEXEC;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let recv_flags = RecvFlags::empty();
+        let message = recvmsg(&self.fd, &mut iov, &mut ancillary, recv_flags)
+            .context("failed to receive executor control message")?;
 
         if message.bytes == 0 {
             anyhow::bail!("executor control channel reached EOF");
+        }
+        if message.flags.contains(ReturnFlags::CTRUNC) {
+            anyhow::bail!("executor control ancillary data was truncated");
         }
 
         let mut attached_fd = None;
         let mut saw_extra_fd = false;
         let bytes_read = message.bytes;
-        for cmsg in message
-            .cmsgs()
-            .context("failed to inspect executor control ancillary data")?
-        {
-            if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                for raw_fd in fds {
+        for cmsg in ancillary.drain() {
+            if let RecvAncillaryMessage::ScmRights(fds) = cmsg {
+                for fd in fds {
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    set_cloexec(&fd)?;
                     if attached_fd.is_none() {
-                        attached_fd = Some(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                        attached_fd = Some(fd);
                     } else {
                         saw_extra_fd = true;
-                        drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                        drop(fd);
                     }
                 }
             }
         }
-        let _ = message;
 
         if saw_extra_fd {
             anyhow::bail!("executor control message carried more than one attached fd");
@@ -1655,11 +1640,11 @@ fn unix_service_channel() -> Result<(UnixStream, OwnedFd)> {
 
 #[cfg(unix)]
 fn set_cloexec(fd: &OwnedFd) -> Result<()> {
-    let current_flags =
-        fcntl(fd, FcntlArg::F_GETFD).context("failed to read socket close-on-exec flags")?;
+    let current_flags = fcntl(fd, FcntlArg::F_GETFD)
+        .context("failed to read file descriptor close-on-exec flags")?;
     let updated_flags = FdFlag::from_bits_truncate(current_flags) | FdFlag::FD_CLOEXEC;
     fcntl(fd, FcntlArg::F_SETFD(updated_flags))
-        .context("failed to set socket close-on-exec flag")?;
+        .context("failed to set file descriptor close-on-exec flag")?;
     Ok(())
 }
 
@@ -1836,8 +1821,8 @@ mod tests {
         .unwrap();
         let mut reader = ControlReader { fd: read_fd };
 
-        let first = File::open("/dev/null").unwrap();
-        let second = File::open("/dev/null").unwrap();
+        let (mut first_peer, first) = StdUnixStream::pair().unwrap();
+        let (mut second_peer, second) = StdUnixStream::pair().unwrap();
         let payload = encode_message(
             &ExecutorRequest::Hello(ExecutorHello {
                 home_dir: PathBuf::from("/tmp"),
@@ -1857,6 +1842,59 @@ mod tests {
             Ok(_) => panic!("control message with multiple attached fds unexpectedly succeeded"),
             Err(err) => assert!(err.to_string().contains("more than one attached fd")),
         }
+
+        drop(first);
+        drop(second);
+        first_peer.set_nonblocking(true).unwrap();
+        second_peer.set_nonblocking(true).unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            first_peer.read(&mut byte).unwrap(),
+            0,
+            "first rejected attached fd leaked"
+        );
+        assert_eq!(
+            second_peer.read(&mut byte).unwrap(),
+            0,
+            "second rejected attached fd leaked"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn received_control_fds_are_close_on_exec() {
+        let (read_fd, write_fd) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+        let mut reader = ControlReader { fd: read_fd };
+
+        let attached = File::open("/dev/null").unwrap();
+        let payload = encode_message(
+            &ExecutorRequest::Hello(ExecutorHello {
+                home_dir: PathBuf::from("/tmp"),
+                shell: PathBuf::from("/bin/bash"),
+                exec_mode: ExecMode::ShellLogin,
+            }),
+            "failed to encode executor control message",
+        )
+        .unwrap();
+        let iov = [IoSlice::new(&payload)];
+        let rights = [attached.as_raw_fd()];
+        let cmsgs = [ControlMessage::ScmRights(&rights)];
+
+        sendmsg::<()>(write_fd.as_raw_fd(), &iov, &cmsgs, MsgFlags::empty(), None).unwrap();
+
+        let packet = reader.recv::<ExecutorRequest>().unwrap();
+        let received = packet.attached_fd.expect("missing attached fd");
+        let flags = fcntl(&received, FcntlArg::F_GETFD).unwrap();
+        assert!(
+            FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC),
+            "received attached fd was inheritable"
+        );
     }
 
     #[cfg(unix)]

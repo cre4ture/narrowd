@@ -1257,6 +1257,7 @@ dependencies = [
  "portable-pty",
  "russh",
  "russh-sftp",
+ "rustix",
  "serde",
  "serde_json",
  "ssh-key",
