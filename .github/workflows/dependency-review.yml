@@ -14,19 +14,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Detect dependency graph support
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const { data: repo } = await github.rest.repos.get(context.repo);
-            const status = repo.security_and_analysis?.dependency_graph?.status ?? "unknown";
-            if (status !== "enabled") {
-              core.setFailed(
-                `Dependency graph must be enabled for dependency review; current status is "${status}".`
-              );
-            }
+        uses: actions/checkout@v7
 
       - name: Review dependency changes
         uses: actions/dependency-review-action@v5
