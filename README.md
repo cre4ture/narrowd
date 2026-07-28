@@ -1,78 +1,117 @@
 # narrowd
 
-`narrowd` is a security hardened, single-user Rust SSH daemon built around `russh`.
+`narrowd` is a security-hardened, single-user SSH daemon written in Rust and
+built on `russh`. It gives one local account everything needed for remote work:
+an interactive shell, command execution, SFTP, and TCP forwarding through
+standard `ssh` and `scp` clients.
 
-It is designed as a `ssh`- and `scp`-compatible lightweight remote-access daemon for one Unix account.
-But its explicitly NOT a full drop-in replacement for a hardened multi-user `sshd`.
+Its focused model is the point. `narrowd` leaves out multi-user account
+management, legacy protocols, and policy machinery it does not need. The
+result is a compact remote-access service with modern cryptography, bounded
+pre-authentication resource use, and a separate post-authentication executor
+process on Unix.
 
-Current feature surface:
+## Highlights
 
-- public-key auth against one `authorized_keys` file
+- public-key authentication against one `authorized_keys` file
 - interactive shell as the daemon process user
-- `exec` requests via the configured shell wrapper (`ExecMode`)
-- SFTP subsystem backed by the local filesystem
+- `exec` requests through a configurable shell wrapper (`ExecMode`)
+- SFTP backed by the local filesystem
 - local and remote TCP forwarding
+- automatic `authorized_keys` reload with last-known-good fallback
+- user-scoped deployment on Linux and Windows
 
-Not implemented yet:
+## Deliberate scope
 
-- config reload
+`narrowd` is purpose-built for one trusted user, not a reduced clone of a
+multi-user `sshd`. Its deliberately small scope keeps operation and review
+straightforward:
 
-Explicit NON-Goals:
+- one local account per daemon instance; use `su` after login if local policy
+  permits switching users
+- configuration changes take effect after a restart
+- no legacy SCP protocol; current `scp` clients use SFTP by default
+- no X11 forwarding; use Waypipe over a TCP tunnel instead
 
-- multi-user account/session management (instead, use `su` to change user in terminal when logged in)
-- support of any legacy or outdated functionality (use modern alternatives instead)
-  - legacy SCP protocol (modern `scp` tool uses sftp already by default)
-  - X11 forwarding (use waypipe and TCP tunnel instead)
+## Security model
 
-Security model / exposure guidance:
+Every accepted key is trusted to act as the daemon process user. A successful
+login therefore receives shell, `exec`, SFTP, and forwarding access with that
+account's permissions. This explicit trust boundary is the foundation of the
+single-user design.
 
-- A successful login gets shell, `exec`, SFTP, and forwarding access as the daemon process user. This is intentional for the single-user design.
-- The SSH login username must exactly match the daemon process user's account name. Other usernames are rejected instead of being silently mapped to the daemon user.
-- The public exposure profile only accepts modern Ed25519-family SSH keys for both the host key and user authentication keys.
-- The public exposure profile also keeps a narrow SSH transport surface: modern KEX only, modern ciphers/MACs only, and no SSH compression.
-- Pre-auth resource controls are built in for public exposure: global/per-IP/per-subnet unauthenticated connection caps, per-IP new-connection rate limiting, temporary bans after repeated auth failures, a short client-banner timeout, and an absolute login grace deadline that also covers KEX stalls.
-- Post-auth OS work runs in a separate executor process. The network-facing SSH parser process no longer directly spawns shells, opens PTYs, touches SFTP state, or binds/connects forwarding sockets itself.
-- In the main `narrowd` binary, `no_new_privs` is applied only after the executor process has been spawned. That keeps the pre-auth parser constrained while still allowing post-auth shells to use normal local privilege-escalation tools such as `sudo` if the underlying system would otherwise permit them.
-- On Linux, the pre-auth process also installs a default-deny seccomp allowlist and a Landlock filesystem sandbox after startup. That denies `exec` and other non-essential syscalls in the parser process while limiting its filesystem view to read-only access under the `authorized_keys` directory tree. This hardened path requires Landlock support from the running kernel.
-- The `authorized_keys` cache is kept in memory and reloaded automatically on file changes with a small debounce. If a reload fails, `narrowd` keeps serving from the last known-good in-memory cache and logs the failure.
-- SFTP is not chrooted or confined to a separate subtree. It follows the filesystem permissions of the daemon process user. If that same user is intentionally allowed shell access, this does not expand privileges beyond that account.
-- `authorized_keys` is used for key matching, but `narrowd` only accepts plain key lines. Entries that include OpenSSH key options such as `command=`, `from=`, or no-forwarding flags are completely rejected instead of being interpreted as unrestricted keys.
-- TCP forwarding is deliberately permissive when enabled. This is useful for trusted personal access, but it also means accepted keys can use the host as a tunnel endpoint.
-- This is still an MVP and has not had the maturity, audit history, or defense-in-depth work of OpenSSH.
+- **Exact identity mapping.** The SSH login username must match the daemon
+  process user's account name. Other usernames are rejected rather than
+  silently mapped to that account.
+- **Modern cryptography.** The public-exposure profile accepts Ed25519 host
+  keys and Ed25519-family user keys, a narrow set of modern KEX algorithms,
+  ciphers, and MACs, and no SSH compression.
+- **Built-in admission controls.** Global, per-IP, and per-subnet connection
+  caps, per-IP rate limiting, temporary bans after repeated authentication
+  failures, short banner and KEX timeouts, and an absolute login deadline bound
+  unauthenticated resource use.
+- **Process separation on Unix.** A dedicated executor owns shells, PTYs, SFTP
+  state, and forwarding sockets. The network-facing SSH parser communicates
+  with it over a constrained control channel.
+- **Parser sandboxing on Linux.** After spawning the executor, the parser
+  applies `no_new_privs`, a default-deny seccomp allowlist, and a Landlock
+  filesystem sandbox. It cannot execute programs and sees only the read-only
+  `authorized_keys` directory tree, while authenticated sessions retain the
+  account's normal local capabilities. This path requires Landlock support
+  from the running kernel.
+- **Resilient key reloads.** The in-memory `authorized_keys` cache reloads
+  automatically after file changes. A failed reload is logged while the last
+  known-good cache remains active.
+- **Account-level SFTP.** SFTP follows the daemon user's filesystem
+  permissions. It is not chrooted or limited to a separate subtree, because a
+  trusted key already has shell access as the same account.
+- **Plain allow-or-deny keys.** Entries with OpenSSH options such as
+  `command=`, `from=`, or forwarding restrictions are rejected completely
+  rather than treated as unrestricted keys.
+- **Trusted forwarding.** TCP forwarding is deliberately permissive when
+  enabled, so accepted keys can use the host as a tunnel endpoint.
 
-Compared to an unrestricted OpenSSH login for the same Unix user:
+## Positioning versus OpenSSH
 
-- The post-authentication impact is broadly similar. A stolen private key is bad in both cases if that key is supposed to grant unrestricted access to the same account.
-- Broad shell access, broad forwarding, and unrestricted file access are not unique to `narrowd` if those same capabilities are intentionally enabled in OpenSSH.
-- The main security difference is not the permission scope after login. It is the amount of hardening around the internet-facing SSH service itself.
-- OpenSSH benefits from a much longer audit history, more operational hardening, and more defense-in-depth. `narrowd` is simpler and intentionally less featureful, but it does not yet have that maturity.
-- In practice, this means that choosing `narrowd` over unrestricted OpenSSH is mostly accepting more implementation-maturity risk, not intentionally granting a larger set of user-level permissions.
+For unrestricted shell access to the same local account, `narrowd` and OpenSSH
+grant broadly comparable post-authentication permissions. The difference is in
+their focus: `narrowd` offers a compact single-user design with a tightly
+controlled pre-authentication surface, while OpenSSH offers a far broader
+policy and compatibility surface backed by decades of audit and operational
+history.
 
-Reasonable use cases:
+Choose `narrowd` when its trusted-key, single-user model matches the deployment.
+Choose OpenSSH when you need multi-user administration, per-key restrictions,
+legacy compatibility, or an implementation mandated by policy or compliance.
 
-- personal remote access to your own machine, dev box, lab host, or VM
-- for sensitive infratructure: access protected by another trust boundary such as Tailscale, WireGuard, a VPN, or a strict source-IP firewall
+## Where `narrowd` fits
+
+- personal remote access to your own machine, dev box, lab host, or VM, whether
+  reached over a LAN, VPN, or a deliberately exposed SSH port
 - setups where every accepted key is fully trusted to act as the daemon process user
 - environments where unrestricted shell and port forwarding are desired features rather than policy violations
+- sensitive infrastructure protected by an additional trust boundary such as
+  Tailscale, WireGuard, a VPN, or a strict source-IP firewall
 
-Use cases where `narrowd` is NOT a good fit:
+## Where another SSH server fits better
 
 - a general-purpose internet-facing SSH service for multiple users
 - systems that rely on `authorized_keys` restrictions or fine-grained SSH policy enforcement instead of plain allow-or-deny keys
 - locked-down SFTP-only environments, chrooted file access, or reduced-blast-radius account separation
-- high-sensitivity or public-facing production systems where you would normally choose OpenSSH for its hardening and long operational track record
+- environments that require a formally audited SSH implementation or OpenSSH's
+  long operational track record
 
-For a concrete checklist of public-internet hardening work under the
-"attacker has no stolen key" threat model, see
+For the detailed threat model and completed public-exposure hardening checklist
+under the "attacker has no stolen key" assumption, see
 [`docs/public-exposure-roadmap.md`](docs/public-exposure-roadmap.md).
 
-CI / repository automation:
+## Quality and security checks
 
 - GitHub Actions covers formatting, clippy, rustdoc with warnings denied, Linux tests on stable and beta, a macOS build check, and a Debian package smoke test.
 - Security automation also includes `cargo audit`, CodeQL analysis, and GitHub dependency review on pull requests when the repository dependency graph is enabled.
 - The committed `cargo audit` policy intentionally ignores `RUSTSEC-2023-0071` only because `narrowd`'s public-exposure profile rejects RSA host and user keys entirely. If RSA support is ever added, that exception should be removed and reevaluated immediately.
 
-Quick start:
+## Quick start
 
 ```bash
 cargo run -- --print-sample-config
@@ -84,7 +123,7 @@ By default `narrowd` looks for `~/.config/narrowd/narrowd.conf`, generates an
 Ed25519 host key if one does not exist yet, and authenticates against
 `~/.ssh/authorized_keys`.
 
-Local Debian package:
+## Local Debian package
 
 ```bash
 ./scripts/build-deb.sh
@@ -105,7 +144,7 @@ process. The packaged user service intentionally does not use
 forces `NoNewPrivs=1` onto the whole service tree and would break post-auth
 tools such as `sudo`.
 
-Windows MSIX user-session install:
+## Windows MSIX user-session install
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Build-NarrowdMsix.ps1
@@ -130,7 +169,7 @@ The packaged manifest also declares the default inbound TCP `2223` firewall
 rule. If you later change the port in `%LOCALAPPDATA%\narrowd\narrowd.conf`,
 adjust the firewall rule manually so it matches the new port.
 
-Legacy Windows service install (administrator, Session 0):
+## Legacy Windows service install (administrator, Session 0)
 
 ```powershell
 cargo build --release
@@ -144,7 +183,7 @@ That older installer still exists when you explicitly want a native Windows
 service with `Log on as a service`, but the MSIX route is the better fit for a
 user-session daemon that should come up automatically when the user logs in.
 
-RDP over SSH tunnel:
+## RDP over SSH tunnel
 
 ```bash
 ssh -N -T -o ExitOnForwardFailure=yes \
