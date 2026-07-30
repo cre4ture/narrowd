@@ -80,6 +80,34 @@ controlled pre-authentication surface, while OpenSSH offers a far broader
 policy and compatibility surface backed by decades of audit and operational
 history.
 
+OpenSSH remains a mature, heavily reviewed implementation, but its history also
+shows the security cost of that breadth:
+
+- the 2024
+  [`regreSSHion` signal-handler race](https://www.openssh.com/txt/release-9.8)
+  made unauthenticated root code execution possible on some systems after a
+  2006 fix was accidentally lost during a logging refactor;
+- an experimental
+  [client roaming feature](https://www.openssh.com/txt/release-7.1p2), enabled
+  by default despite having no released server counterpart, could disclose
+  client memory including private keys;
+- [forwarded `ssh-agent` access](https://www.openssh.com/txt/release-9.3p2)
+  could be combined with PKCS#11 shared-library loading to execute code on the
+  client; and
+- protocol, policy, and legacy-tool interactions have caused weaknesses such
+  as the [Terrapin attack](https://www.openssh.com/txt/release-9.6),
+  [forwarding settings](https://www.openssh.com/security.html) that did not
+  enforce all documented restrictions, and
+  [unexpected local file writes by `scp`](https://www.openssh.com/txt/release-8.0).
+
+These problems did not have one root cause. Some involved C memory or
+asynchronous-signal safety, while others came from protocol details, legacy
+compatibility, powerful forwarding features, helper processes, or the large
+configuration matrix. OpenSSH mitigates these risks with extensive review,
+privilege separation, sandboxing, conservative defaults, and a long record of
+rapid fixes. Its history is therefore an argument both for its maturity and
+for keeping an SSH service no larger than its actual job requires.
+
 `narrowd` also benefits from Rust's safety model. OpenSSH is primarily
 implemented in C; in safe Rust, ownership and the type system rule out broad
 classes of use-after-free, double-free, and data-race bugs at compile time,
@@ -90,16 +118,33 @@ guarantee: `unsafe` code, native dependencies, protocol mistakes, and logic
 flaws still require careful review. It does, however, give `narrowd` a strong
 implementation-level safety baseline.
 
-Choose `narrowd` when its trusted-key, single-user model matches the deployment.
-Choose OpenSSH when you need multi-user administration, per-key restrictions,
-legacy compatibility, or an implementation mandated by policy or compliance.
+For `narrowd`'s stated use case—occasional remote access to a personal machine,
+development box, lab host, or VM—the smaller model is fully sufficient when
+every accepted key is trusted to act as the local account and the service and
+host are kept up to date. This is especially valuable for occasional operators
+and less-experienced administrators: the strong baseline does not depend on
+mastering OpenSSH's full policy language or remembering to disable unrelated
+subsystems. With fewer features and fewer ways to weaken the intended model
+accidentally, a well-maintained `narrowd` deployment can achieve a stronger
+effective security posture than an OpenSSH installation operated without
+comparable SSH expertise.
+
+That is a comparison of realistic deployments, not a claim that `narrowd` is
+universally safer than current OpenSSH in expert hands. Choose `narrowd` when
+its trusted-key, single-user model matches the deployment. Choose OpenSSH when
+you need multi-user administration, per-key restrictions, legacy
+compatibility, or an implementation mandated by policy or compliance.
 
 ## Where `narrowd` fits
 
 - personal remote access to your own machine, dev box, lab host, or VM, whether
   reached over a LAN, VPN, or a deliberately exposed SSH port
-- setups where every accepted key is fully trusted to act as the daemon process user
-- environments where unrestricted shell and port forwarding are desired features rather than policy violations
+- occasional operation by people who need dependable personal SSH access
+  without becoming experts in a general-purpose SSH policy engine
+- setups where every accepted key is fully trusted to act as the daemon process
+  user
+- environments where unrestricted shell and port forwarding are desired
+  features rather than policy violations
 - sensitive infrastructure protected by an additional trust boundary such as
   Tailscale, WireGuard, a VPN, or a strict source-IP firewall
 
