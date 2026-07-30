@@ -108,15 +108,42 @@ privilege separation, sandboxing, conservative defaults, and a long record of
 rapid fixes. Its history is therefore an argument both for its maturity and
 for keeping an SSH service no larger than its actual job requires.
 
-`narrowd` also benefits from Rust's safety model. OpenSSH is primarily
-implemented in C; in safe Rust, ownership and the type system rule out broad
-classes of use-after-free, double-free, and data-race bugs at compile time,
-while bounds checks prevent out-of-range indexing from becoming unchecked
-memory corruption. These guarantees reduce the memory-corruption surface of a
-network-facing daemon without relying on review alone. Rust is not a security
-guarantee: `unsafe` code, native dependencies, protocol mistakes, and logic
-flaws still require careful review. It does, however, give `narrowd` a strong
-implementation-level safety baseline.
+`narrowd` also benefits from Rust's safety model. One of the most direct and
+historically productive paths from unauthenticated network input to arbitrary
+native code execution in traditional C daemons has been memory corruption:
+buffer overflows, out-of-bounds access, use-after-free, double-free, and
+related pointer errors. Successful exploitation may turn these faults into
+code injection or code-reuse attacks that take control of the process.
+
+Safe Rust removes this path from `narrowd`'s own implementation structurally
+rather than merely making it less likely. Ownership and the type system
+prevent use-after-free, double-free, and data races, while bounds checks turn
+invalid indexing into a controlled panic instead of unchecked memory
+corruption. The `narrowd` library and binaries all use
+`#![forbid(unsafe_code)]`, so this guarantee cannot be bypassed accidentally
+inside the project's own code.
+
+For a network-facing service, that language-level protection is reinforced by
+four layers:
+
+1. **Memory-safe project code.** Classic native memory-corruption primitives
+   are unavailable in `narrowd`'s own safe Rust implementation.
+2. **A narrow integration surface.** `narrowd` omits PAM, GSSAPI, X11, agent
+   forwarding, runtime provider loading, and other subsystems that its
+   single-user use case does not need.
+3. **Parser isolation.** The network-facing parser and post-authentication
+   executor are separate processes on Unix, and Linux additionally confines
+   the parser with `no_new_privs`, seccomp, and Landlock.
+4. **User-level execution.** `narrowd` is intended to run as the target account
+   rather than as a privileged root daemon, so a compromised process starts
+   with that user's permissions instead of immediate control of the machine.
+
+Rust is not a complete RCE prevention mechanism. Logic errors, command
+injection, authentication bypasses, unsafe dependency code, and operating
+system flaws still require review and timely updates. Even if such a flaw
+remains, however, an attacker must cross additional process, sandbox, and
+account-privilege boundaries to progress from network input to full system
+control. The path to a complete takeover is therefore materially longer.
 
 For `narrowd`'s stated use case—occasional remote access to a personal machine,
 development box, lab host, or VM—the smaller model is fully sufficient when
