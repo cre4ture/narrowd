@@ -15,7 +15,6 @@ package_arch=${PACKAGE_ARCH:-$(dpkg-architecture -qDEB_HOST_ARCH)}
 output_dir=${OUTPUT_DIR:-"$repo_root/target/debian"}
 build_root="$output_dir/.build/${package_name}_${package_version}_${package_arch}"
 staging_dir="$build_root/root"
-binary_path="$repo_root/target/release/$package_name"
 deb_path="$output_dir/${package_name}_${package_version}_${package_arch}.deb"
 
 maintainer_name=${DEBFULLNAME:-$(git config --get user.name 2>/dev/null || id -un)}
@@ -37,9 +36,17 @@ require_tool() {
     fi
 }
 
-for tool in awk cargo dpkg-architecture dpkg-deb install; do
+for tool in awk cargo dpkg-architecture dpkg-deb install sed; do
     require_tool "$tool"
 done
+
+cargo_target_dir=$(cargo metadata --format-version=1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+if [[ -z "$cargo_target_dir" ]]; then
+    printf 'unable to determine Cargo target directory\n' >&2
+    exit 1
+fi
+
+binary_path="$cargo_target_dir/release/$package_name"
 
 mkdir -p "$output_dir"
 rm -f "$output_dir/${package_name}"_*.deb

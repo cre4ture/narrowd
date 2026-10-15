@@ -118,6 +118,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build Debian package
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/narrowd-cargo-target
         run: ./scripts/build-deb.sh
 
       - name: Inspect Debian package contents
