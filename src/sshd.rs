@@ -1494,6 +1494,9 @@ fn public_exposure_preferred() -> russh::Preferred {
             ssh_key::Algorithm::Ed25519,
             ssh_key::Algorithm::SkEd25519,
         ]),
+        // Certificate host keys are client-only and must remain disabled for
+        // this server's explicit public-exposure algorithm policy.
+        host_key_certificates: Cow::Borrowed(&[]),
         cipher: Cow::Owned(vec![
             russh::cipher::CHACHA20_POLY1305,
             russh::cipher::AES_256_GCM,
@@ -1621,6 +1624,11 @@ mod tests {
         assert!(!is_user_key_algorithm_allowed(&ssh_key::Algorithm::Rsa {
             hash: None
         }));
+    }
+
+    #[test]
+    fn public_exposure_preference_disables_host_key_certificates() {
+        assert!(public_exposure_preferred().host_key_certificates.is_empty());
     }
 
     #[test]

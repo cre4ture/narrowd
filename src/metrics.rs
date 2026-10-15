@@ -24,7 +24,7 @@ impl ServerMetrics {
     pub fn preauth_connection_closed(&self) {
         self.inner
             .current_unauthenticated_connections
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(1))
             })
             .ok();
