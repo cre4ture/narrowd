@@ -425,18 +425,21 @@ async fn repeated_auth_rejects_are_log_limited() -> Result<()> {
         assert!(!auth.success(), "wrong username should not authenticate");
     }
 
-    let matching_logs = test_logs()
-        .into_iter()
+    let logs = test_logs();
+    let matching_logs = logs
+        .iter()
         .filter(|entry| {
-            entry.contains("event=auth_rejected")
-                && entry.contains("category=auth-reject-username")
-                && entry.contains("wrong-user-log-limit-test")
+            entry.contains("event=auth_rejected") && entry.contains("category=auth-reject-username")
         })
         .count();
 
     assert_eq!(
         matching_logs, 1,
         "expected only the first repeated auth warning to be logged"
+    );
+    assert!(
+        logs.iter().all(|entry| !entry.contains(wrong_user)),
+        "authentication logs must not contain the requested login user"
     );
 
     task.abort();
