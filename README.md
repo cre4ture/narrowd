@@ -224,6 +224,12 @@ systemctl --user enable --now narrowd.service
 The build script uses Cargo's resolved target directory, so it also works with
 `CARGO_TARGET_DIR` or Cargo's `build.target-dir` configuration.
 
+The binary's `--version` output and the default Debian package version both
+come from `Cargo.toml`. Before creating a release tag, update the package
+version in `Cargo.toml` and `Cargo.lock` and commit those changes. A Git tag
+does not change the compiled version. `PACKAGE_VERSION` overrides only the
+Debian package metadata, for example when adding a packaging revision.
+
 The generated package is intentionally set up for a `systemd --user` service,
 not a root-owned system daemon. The packaged launcher refuses to start as
 `root`, so the SSH session, SFTP access, and port forwarding all run with the
