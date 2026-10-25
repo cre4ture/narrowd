@@ -702,7 +702,6 @@ struct ClientHandler {
     preauth: PreauthContext,
     pending_channels: HashMap<ChannelId, PendingChannel>,
     remote_forwards: HashMap<ForwardKey, RemoteForwardHandle>,
-    requested_user: Option<String>,
 }
 
 impl ClientHandler {
@@ -713,27 +712,20 @@ impl ClientHandler {
             preauth,
             pending_channels: HashMap::new(),
             remote_forwards: HashMap::new(),
-            requested_user: None,
         }
     }
 
     fn authorize_key(&mut self, user: &str, public_key: &ssh_key::PublicKey) -> Result<Auth> {
-        self.requested_user = Some(user.to_string());
         if !login_user_matches_daemon(user, &self.state.daemon_username) {
             self.record_auth_failure(
-                user,
                 "auth-reject-username",
-                &format!(
-                    "requested login user does not match daemon user {}",
-                    self.state.daemon_username
-                ),
+                "requested login user is not permitted",
             );
             return Ok(Auth::reject());
         }
 
         if !is_user_key_algorithm_allowed(&public_key.algorithm()) {
             self.record_auth_failure(
-                user,
                 "auth-reject-key-algorithm",
                 &format!(
                     "unsupported public key algorithm {:?}",
@@ -745,13 +737,12 @@ impl ClientHandler {
 
         if self.state.is_authorized(public_key)? {
             info!(
-                "accepted public key for requested user {user} from {}",
+                "event=auth_accepted peer={} authentication=public_key",
                 peer_label(self.peer)
             );
             Ok(Auth::Accept)
         } else {
             self.record_auth_failure(
-                user,
                 "auth-reject-unknown-key",
                 "public key not present in authorized_keys cache",
             );
@@ -771,16 +762,14 @@ impl ClientHandler {
             .ok_or_else(|| anyhow!("unknown channel {channel:?}"))
     }
 
-    fn record_auth_failure(&self, user: &str, category: &'static str, reason: &str) {
+    fn record_auth_failure(&self, category: &'static str, reason: &str) {
         let peer_ip = self.peer.map(|peer| peer.ip());
         let Some(ip) = peer_ip else {
             self.state.metrics.record_auth_failure(None, false);
             self.state.warn_limited(
                 self.peer,
                 category,
-                format!(
-                    "event=auth_rejected peer=<unknown> user={user:?} category={category} reason={reason:?}"
-                ),
+                auth_rejection_log_message(self.peer, category, reason, None),
             );
             return;
         };
@@ -790,11 +779,25 @@ impl ClientHandler {
         self.state.warn_limited(
             self.peer,
             category,
-            format!(
-                "event=auth_rejected peer={} user={user:?} category={category} reason={reason:?} temporary_ban={banned}",
-                peer_label(self.peer),
-            ),
+            auth_rejection_log_message(self.peer, category, reason, Some(banned)),
         );
+    }
+}
+
+fn auth_rejection_log_message(
+    peer: Option<SocketAddr>,
+    category: &'static str,
+    reason: &str,
+    temporary_ban: Option<bool>,
+) -> String {
+    match temporary_ban {
+        Some(temporary_ban) => format!(
+            "event=auth_rejected peer={} category={category} reason={reason:?} temporary_ban={temporary_ban}",
+            peer_label(peer),
+        ),
+        None => {
+            format!("event=auth_rejected peer=<unknown> category={category} reason={reason:?}")
+        }
     }
 }
 
@@ -831,9 +834,8 @@ impl server::Handler for ClientHandler {
         self.authorize_key(user, public_key)
     }
 
-    async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
+    async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
         self.record_auth_failure(
-            user,
             "auth-reject-password",
             "password authentication is disabled",
         );
@@ -842,11 +844,7 @@ impl server::Handler for ClientHandler {
 
     async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
         self.preauth.mark_authenticated();
-        info!(
-            "event=auth_success peer={} user={:?}",
-            peer_label(self.peer),
-            self.requested_user.as_deref().unwrap_or("<unknown>")
-        );
+        info!("event=auth_success peer={}", peer_label(self.peer));
         Ok(())
     }
 
@@ -1612,6 +1610,24 @@ mod tests {
     fn rejects_non_matching_login_usernames() {
         assert!(login_user_matches_daemon("uli", "uli"));
         assert!(!login_user_matches_daemon("root", "uli"));
+    }
+
+    #[test]
+    fn auth_rejection_logs_do_not_include_login_names() {
+        let message = auth_rejection_log_message(
+            Some(SocketAddr::from(([192, 0, 2, 1], 2222))),
+            "auth-reject-username",
+            "requested login user is not permitted",
+            Some(true),
+        );
+
+        assert_eq!(
+            message,
+            "event=auth_rejected peer=192.0.2.1:2222 category=auth-reject-username reason=\"requested login user is not permitted\" temporary_ban=true"
+        );
+        assert!(!message.contains("user="));
+        assert!(!message.contains("uli"));
+        assert!(!message.contains("alice"));
     }
 
     #[test]
